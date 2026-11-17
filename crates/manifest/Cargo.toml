@@ -1,0 +1,10 @@
+[package]
+name = "manifest"
+description = "源声明模型与校验:内置 preset 与第三方插件走同一 schema(设计文档 §9)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

@@ -1,0 +1,30 @@
+[package]
+name = "gateway"
+description = "axum 网关:组装 L0+L1,路由/安全中间件/候选循环/上游转发与翻译接线"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+manifest = { workspace = true }
+ledger = { workspace = true }
+proto = { workspace = true }
+registry = { workspace = true }
+credentials = { workspace = true }
+router = { workspace = true }
+translate = { workspace = true }
+agents = { workspace = true }
+axum = { workspace = true, features = ["query"] }
+tokio = { workspace = true, features = ["process"] }
+reqwest = { workspace = true }
+httpdate = "1.0.3"
+serde = { workspace = true }
+serde_json = { workspace = true }
+getrandom = { workspace = true }
+futures-core = { workspace = true }
+futures-util = { workspace = true }
+
+[dev-dependencies]
+reqwest = { workspace = true }
+rusqlite = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "test-util"] }

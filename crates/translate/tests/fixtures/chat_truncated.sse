@@ -1,0 +1,2 @@
+: synthetic v0 (截断流:分块合法、无 finish_reason、无 [DONE]、末行无换行)
+data: {"id":"chatcmpl-smoke-3","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"par"},"finish_reason":null}]}

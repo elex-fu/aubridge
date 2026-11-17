@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = ["crates/proto", "crates/translate", "crates/smoke", "crates/manifest", "crates/router", "crates/registry", "crates/gateway", "crates/agents", "crates/ledger", "crates/credentials"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "system-proxy"] }
+tauri = "2"
+proto = { path = "crates/proto" }
+translate = { path = "crates/translate" }
+manifest = { path = "crates/manifest" }
+router = { path = "crates/router" }
+registry = { path = "crates/registry" }
+gateway = { path = "crates/gateway" }
+futures-core = "0.3"
+futures-util = { version = "0.3", default-features = false }
+rusqlite = { version = "0.32", features = ["bundled"] }
+sha2 = "0.10"
+keyring = "3"
+getrandom = "0.3"
+agents = { path = "crates/agents" }
+ledger = { path = "crates/ledger" }
+credentials = { path = "crates/credentials" }
+
+# 编译加速:依据 docs/crate-layout.md §4.1
+[profile.dev]
+split-debuginfo = "unpacked"
+incremental = true
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,12 @@
+[package]
+name = "agents"
+description = "agent wiring 三件套:stash / applied / drift,原子写,卸载无尸体(设计文档 §8.6)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+jsonc-parser = { version = "0.34", features = ["cst", "serde"] }
+toml = "1.1"

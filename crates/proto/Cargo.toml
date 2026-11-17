@@ -1,0 +1,10 @@
+[package]
+name = "proto"
+description = "aubridge 线协议类型(Anthropic Messages / OpenAI Chat)与 SSE 编解码"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

@@ -1,0 +1,13 @@
+[package]
+name = "smoke"
+description = "aubridge Tauri 桌面壳与同进程本地网关"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gateway = { workspace = true }
+tauri = { workspace = true, features = ["tray-icon"] }
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }

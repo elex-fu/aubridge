@@ -1,0 +1,7 @@
+[build]
+incremental = true
+
+[alias]
+ck = "check --workspace --all-targets"
+tg = "test -p translate"
+smoke = "run -p smoke"

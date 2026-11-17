@@ -1,0 +1,43 @@
+{
+  "productName": "aubridge",
+  "version": "0.1.0",
+  "identifier": "dev.aubridge.smoke",
+  "build": {
+    "beforeBuildCommand": {
+      "script": "npm run build",
+      "cwd": "web"
+    },
+    "frontendDist": "ui"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "aubridge",
+        "url": "index.html",
+        "width": 800,
+        "height": 480,
+        "minWidth": 760,
+        "minHeight": 480,
+        "maximized": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:*; style-src 'self' 'unsafe-inline'; object-src 'none'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/256x256.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "targets": [
+      "dmg",
+      "app"
+    ]
+  }
+}

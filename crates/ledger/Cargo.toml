@@ -1,0 +1,13 @@
+[package]
+name = "ledger"
+description = "quota ledger:用量记账、价格 null-cost 纪律、省 $X 口径(设计文档 §8.3)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rusqlite = { workspace = true }
+manifest = { workspace = true }
+router = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

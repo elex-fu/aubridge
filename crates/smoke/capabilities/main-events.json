@@ -1,0 +1,6 @@
+{
+  "identifier": "main-events",
+  "description": "Local main window gateway state notifications",
+  "windows": ["main"],
+  "permissions": ["core:event:allow-listen", "core:event:allow-unlisten"]
+}

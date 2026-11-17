@@ -1,0 +1,12 @@
+[package]
+name = "router"
+description = "免费优先候选循环:纯决策(快照 → 执行计划)+ 错误分类矩阵 + rest 四桶状态转移"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+manifest = { workspace = true }
+proto = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

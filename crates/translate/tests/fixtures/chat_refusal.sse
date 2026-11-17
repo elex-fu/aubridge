@@ -1,0 +1,9 @@
+: synthetic v0 (M0 手工构造;待真实语料替换 — magpie #823)
+data: {"id":"chatcmpl-smoke-2","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"I can't help with that."},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-smoke-2","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"content_filter"}]}
+
+data: {"id":"chatcmpl-smoke-2","object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":8}}
+
+data: [DONE]
+

@@ -61,3 +61,32 @@ Unix 下会话文件权限为 `0600`，正常退出时自动清理。
 开发中。客户端支持 Claude Code 的 Messages 和 `count_tokens`、OpenCode 的 Chat Completions，
 以及 Codex CLI 的流式 HTTP Responses。
 三平台打包和自动更新待交付。每轮实施与验收记录见 `docs/iterations`。
+
+## 本机检查与 macOS 开发包
+
+`scripts/check.zsh` 从锁文件安装前端依赖，再执行前端构建、格式检查、
+严格 Clippy 和工作区全目标测试。它可在有或没有 RTK 的环境中运行。
+
+```sh
+zsh scripts/check.zsh
+```
+
+先提交完整源码基线，再打包。构建命令拒绝脏工作区，将 Git revision、
+工具链版本、全量文件哈希和门禁日志写入 `.local/releases/`，并对应用包
+执行完整 ad-hoc 签名和严格校验。需要 Python 3、Xcode Command Line Tools
+及 Tauri CLI 2（`cargo install tauri-cli --locked`）。
+
+```sh
+python3 scripts/release-macos.py build
+```
+
+从应用菜单退出 aubridge，等待在途请求完成，再用上一步输出的回执安装。
+安装器拒绝替换运行中的应用，保留旧包备份，核对全量文件后启动新包，验证
+健康、额度历史与 cc-switch 导入接口。凭据、用户配置和账本沿用原数据目录。
+
+```sh
+python3 scripts/release-macos.py install .local/releases/<build>/receipt.json
+python3 scripts/release-macos.py verify .local/releases/<build>/receipt.json --app ~/Applications/aubridge.app
+```
+
+这是本机 macOS 开发包流程；三平台发行、公证、自动更新与远端 CI 验证仍待交付。

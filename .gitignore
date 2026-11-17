@@ -1,0 +1,16 @@
+.env
+/target
+Cargo.lock.bak
+.DS_Store
+# 前端工程:依赖与 vite 构建产物(tauri.conf.json frontendDist)。
+crates/smoke/web/node_modules/
+crates/smoke/ui/
+# Tauri 生成的本机 ACL schema；构建时重新生成。
+crates/smoke/gen/
+# 本地发布包、安装备份与验收回执，不包含在源码基线中。
+/.local/
+/*.log
+/Chat
+/environment
+/saved
+__pycache__/

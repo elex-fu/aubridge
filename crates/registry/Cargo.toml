@@ -1,0 +1,11 @@
+[package]
+name = "registry"
+description = "源注册表:manifest 装载 + 内置 preset(OpenRouter/智谱/ModelScope,与第三方插件同 schema)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+manifest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
