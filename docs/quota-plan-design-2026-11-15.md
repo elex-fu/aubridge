@@ -1,7 +1,7 @@
 # 配额窗口历史 + key plan 查询端点 · 技术设计
 
 - 日期:2026-11-15
-- 状态:已实施；代码与回放通过，官方有效 key 读数和额度曲线完整验收待完成（阶段证据见 §9）
+- 状态:已实施；代码、回放与 ChatGPT 真实历史曲线通过；智谱/Kimi 有效 key 的 Plan 查询仍待验（分项证据见 §9）
 - 上游依据:magpie `internal/provider/quota_history.go`(周期判定/节流/保留口径)
   与 `internal/provider/planquota.go`(端点清单/解析语义),机制参考非逐行照抄
 - 关联文档:`docs/product-design.md`(§8.2 主动查询、§8.3 账本、变更记录)、
@@ -223,7 +223,7 @@ flock 与 keychain),环境变量注入 fixture key:
   key 在生产 keychain,debug 二进制因 cdhash ACL 读不了;UI 曲线
   组件 tsc/vite build 已过,渲染待桌面壳目检)。
 
-### 2026-11-17 当前安装版复核
+### 2026-11-17 升级前安装版复核
 
 - 昨晚的安装包已包含额度历史与 cc-switch 导入，两个鉴权管理接口实测均为
   HTTP 200，不能继续沿用 2026-11-16 白天「安装版仍缺接口」的判断。
@@ -232,3 +232,31 @@ flock 与 keychain),环境变量注入 fixture key:
 - 当前桌面页明确显示智谱与 Kimi 凭据未设置，OpenCode 标准 auth 文件不存在。
   本次未导入其他应用凭据、未创建原生登录文件。官方有效 key 读数和原生
   OpenCode 登录/续期仍为独立待验项；已有单点历史也不构成完整曲线目检通过。
+
+### 2026-11-17 已签名源码基线的安装与验收
+
+- 完整源码基线为 Git `e09b983522a56645f95ae3345d2418abe1d4a55b`，包含
+  269 个受跟踪文件、10 个 workspace crate。离线 Git bundle 已恢复成干净检出，
+  锁定依赖的 workspace metadata 校验通过。
+- 使用 `scripts/release-macos.py build` 从该干净提交构建，前端、fmt、严格
+  Clippy 和全目标工作区测试通过：25 个测试目标、434 passed / 0 failed /
+  0 ignored。候选包内嵌 revision、工具链信息，回执记录全部文件哈希。
+- 初次 npm 安装遇到 ETIMEDOUT，离线重试因缺少 Vite 缓存以 ENOTCACHED
+  失败，两份日志保留。采用本机已经启用的 HTTPS 代理作进程内 npm 配置后，
+  锁文件安装和全部门禁完成；没有修改系统代理或依赖锁文件。
+- 旧包此前严格签名校验失败。新包完整 ad-hoc 签名、strict verify 和全量
+  manifest 比对通过。安装器在旧实例仍运行时的拒绝覆盖对照通过；随后经
+  原生 Cmd+Q 正常退出，保留完整旧包并安装，新运行 PID 57987，端口 62760。
+- `/healthz`、鉴权 `/admin/quota-history`、鉴权 `/admin/import/cc-switch`
+  均 HTTP 200。真实原生窗口可读取 9 条 cc-switch 候选，仅查看并取消，未导入。
+- 本机真实 ChatGPT 7d 历史已积累两个点。CUA 展开来源并滚动到额度区后，
+  AX 与截图均确认真实剩余曲线、两个端点及虚线参考可见；没有注入合成历史。
+  5h 仍只有一点，不将它算作完整曲线。此结果验证 wham → ledger → 原生 UI，
+  不替代智谱/Kimi Plan 端点的真实有效凭据查询。
+- 安装前后 aubridge 配置、Codex config/auth、Claude settings 的字节 SHA 均
+  一致；当前登录来源仍为 Codex，share_login=false。智谱/Kimi key 未设置、
+  OpenCode 原生 auth 文件不存在，两项独立外部条件仍待补齐，未冒称验收完成。
+- 本机回执（发布包及运行材料不随源码分发）：
+  `.local/releases/e09b983522a5-20261117T054439Z/` 下的 `receipt.json`、
+  `installation.json`、`acceptance.json`、`running-install-guard.json` 及门禁日志。
+  该基线之后的本次提交仅整理验收文档，生产源码与已安装包使用的提交一致。

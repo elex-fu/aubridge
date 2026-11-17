@@ -90,3 +90,5 @@ python3 scripts/release-macos.py verify .local/releases/<build>/receipt.json --a
 ```
 
 这是本机 macOS 开发包流程；三平台发行、公证、自动更新与远端 CI 验证仍待交付。
+首次安装依赖需要 npm registry 可达；受限网络下可为本次命令设置
+`npm_config_https_proxy` 指向已有代理。构建回执保留失败日志，锁文件不随重试改变。
