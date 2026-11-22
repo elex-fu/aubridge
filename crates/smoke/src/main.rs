@@ -1,5 +1,9 @@
 //! The desktop hosts the same loopback gateway as aubridged.
 
+#[cfg(target_os = "macos")]
+mod update_commands;
+mod update_helper;
+
 use std::sync::{Arc, Mutex};
 
 use gateway::runtime::{GatewayAccess, Runtime};
@@ -258,8 +262,27 @@ fn desktop_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
 }
 
 fn main() {
+    match update_helper::dispatch() {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => {
+            eprintln!("aubridge: update helper: {error}");
+            std::process::exit(1);
+        }
+    }
     let (shutdown_tx, mut shutdown_rx) = async_runtime::channel(1);
     let builder = tauri::Builder::default();
+    #[cfg(target_os = "macos")]
+    let builder = builder.invoke_handler(tauri::generate_handler![
+        gateway_access,
+        update_commands::update_status,
+        update_commands::check_update,
+        update_commands::prepare_update,
+        update_commands::prepare_development_update,
+        update_commands::install_update
+    ]);
+    #[cfg(not(target_os = "macos"))]
+    let builder = builder.invoke_handler(tauri::generate_handler![gateway_access]);
     #[cfg(target_os = "macos")]
     let builder = builder.menu(desktop_menu).on_menu_event(|app, event| {
         if event.id() == APP_QUIT_ID {
@@ -267,9 +290,13 @@ fn main() {
         }
     });
     let app = builder
-        .invoke_handler(tauri::generate_handler![gateway_access])
         .manage(Mutex::new(ShutdownPhase::Serving))
         .setup(move |app| {
+            #[cfg(target_os = "macos")]
+            {
+                app.manage(Arc::new(gateway::app_update::UpdateService::new()));
+                app.manage(update_commands::PendingExit::new(None));
+            }
             let runtime = async_runtime::block_on(Runtime::start(true))?;
             app.manage(runtime.state());
             // 会话文件(变更记录 34):桌面壳与 headless 同样发布,

@@ -3,9 +3,48 @@ interface GatewayAccess {
   admin_token: string;
 }
 
-interface TauriCore {
-  invoke<T>(command: string): Promise<T>;
+export interface BuildInfo {
+  version: string;
+  git_revision: string | null;
+  git_tree: string | null;
+  mode: "source" | "development" | "distribution";
+  profile: string;
+  source_verified: boolean;
+  pid: number;
+  capabilities: string[];
 }
+
+interface TauriCore {
+  invoke<T>(command: string, args?: Record<string, unknown>): Promise<T>;
+}
+
+export function readableActionError(error: unknown, fallback?: string): string {
+  const message = error instanceof Error ? error.message : String(error);
+  if (message.includes("update-maintenance-active")) return "正在准备更新，请稍后再试。";
+  if (message.includes("update-busy")) return "仍有任务运行，请在任务完成后重试更新。";
+  if (message.includes("update-requires-local-desktop-window")) return "请从已安装的 macOS 桌面 App 使用更新功能。";
+  return fallback || message;
+}
+
+export interface DesktopUpdateStatus {
+  state: "not_configured" | "checking" | "current" | "available" | "preparing" | "ready" | "busy" | "installing" | "installed" | "rolled_back" | "failed";
+  version: string | null;
+  offer_handle: string | null;
+  prepared_handle: string | null;
+  reason: string | null;
+}
+
+function updateCommand(command: "update_status" | "check_update" | "prepare_update" | "prepare_development_update" | "install_update", args?: Record<string, unknown>): Promise<DesktopUpdateStatus> {
+  const core = (window as Window & { __TAURI__?: { core: TauriCore } }).__TAURI__?.core;
+  if (!core) return Promise.reject(new Error("请从已安装的 macOS 桌面 App 使用更新功能。"));
+  return core.invoke<DesktopUpdateStatus>(command, args);
+}
+export const desktopUpdateStatus = () => updateCommand("update_status");
+export const checkDesktopUpdate = () => updateCommand("check_update");
+export const prepareDesktopUpdate = (offerHandle: string) => updateCommand("prepare_update", { offerHandle });
+export const prepareDevelopmentUpdate = (archivePath: string, receiptPath: string, independentSha256: string) =>
+  updateCommand("prepare_development_update", { archivePath, receiptPath, independentSha256, confirmed: true });
+export const installDesktopUpdate = (preparedHandle: string) => updateCommand("install_update", { preparedHandle, confirmed: true });
 
 interface TauriEvent {
   listen<T>(event: string, handler: (event: { payload: T }) => void): Promise<() => void>;
@@ -20,6 +59,8 @@ export function listenServingChanged(handler: (serving: boolean) => void): Promi
 }
 
 let access: Promise<GatewayAccess> | undefined;
+
+export function resetGatewayAccess(): void { access = undefined; }
 
 function gatewayAccess(): Promise<GatewayAccess> {
   const core = (window as Window & { __TAURI__?: { core: TauriCore } }).__TAURI__?.core;
@@ -214,6 +255,9 @@ export interface DecisionAttempt {
   chosen?: boolean;
   reason?: string;
   duration_ms?: number;
+  cache_read_tokens?: number | null;
+  cache_write_tokens?: number | null;
+  upstream_request_id?: string | null;
 }
 
 export interface SkippedCandidate {
@@ -227,6 +271,19 @@ export interface SkippedCandidate {
 }
 
 export interface DecisionRow {
+  session_id?: string | null;
+  parent_session_id?: string | null;
+  purpose?: string | null;
+  request_id?: string | null;
+  request_path?: string | null;
+  request_bytes?: number | null;
+  cache_read_tokens?: number | null;
+  cache_write_tokens?: number | null;
+  input_includes_cache?: boolean | null;
+  price_snapshot?: PriceSnapshot | null;
+  benchmark_snapshot?: PriceSnapshot | null;
+  benchmark_estimate?: ValueEstimate | null;
+  estimate?: ValueEstimate | null;
   ts: number;
   model: string;
   agent: string;
@@ -242,12 +299,38 @@ export interface DecisionRow {
 }
 
 export interface Dashboard {
+  value_summary?: ValueSummary | null;
   monthly_savings_status?: "available" | "unavailable";
   monthly_savings_usd?: number | null;
   share_card: string | null;
   providers?: ProviderRow[];
   top_providers?: TopProvider[] | null;
   recent_decisions?: DecisionRow[] | null;
+}
+
+export interface PriceSnapshot {
+  currency: string; unit: string;
+  model: string; provider?: string; basis?: string; target_provider?: string | null; target_model?: string | null; version?: string | null; source: string; observed_at: number | null;
+  price: { input_per_million: number; output_per_million: number;
+    cache_read_per_million: number | null; cache_write_per_million: number | null };
+}
+
+export interface ValueEstimate {
+  api_equivalent_usd: number;
+  cache_rate_fallback: boolean;
+  partial_usage: boolean;
+  cache_value_delta_usd: number | null;
+}
+
+export interface ValueSummary {
+  records: number; priced_records: number; unpriced_records: number; valued_records: number;
+  builtin_priced_records: number; partial_usage_records: number; api_equivalent_usd: number | null;
+  official_usd: number | null; official_valued_records: number; official_priced_records: number; official_price_coverage: number | null;
+  benchmark_priced_records: number; benchmark_valued_records: number; benchmark_coverage: number | null; benchmark_usd: number | null;
+  price_coverage: number | null; cache_read_tokens: number; cache_write_tokens: number;
+  cache_reported_records: number; cache_unknown_records: number; cache_input_tokens: number;
+  cache_hit_rate: number | null; cache_rate_fallback_records: number;
+  cache_value_delta_usd: number | null; cache_value_known_records: number;
 }
 
 // ---- /admin/plugins ----
@@ -275,7 +358,35 @@ export interface StashMeta {
   backed_up_at: number;
 }
 
-export interface SettingsPage {
+export type CostIntent = "confirmed_free_only" | "free_then_subscription";
+export interface SubscriptionAuthorization {
+  provider: string;
+  basis: "personal_channel" | "user_declared";
+  connection_identity: string;
+}
+export interface CostSettings {
+  cost_intent: CostIntent | null;
+  subscription_authorizations: SubscriptionAuthorization[];
+  cost_policy_issue?: string | null;
+}
+export interface SourceHealth {
+  credential: { present: boolean; usable: boolean; required?: boolean };
+  paused: boolean;
+  pending_rebind?: boolean;
+  directory: { fetched_at: number | null; stale: boolean; issue: string | null };
+  last_check: { status: string; model?: string; scope?: string; observed_at?: number } | null;
+  last_real_success_at: number | null;
+  cost: {
+    basis: "confirmed_free" | "authorized_subscription" | "unconfirmed";
+    connection_identity: string;
+    subscription_eligible: boolean;
+    authorized?: boolean;
+    subscription_billing_notice?: string | null;
+  };
+}
+export type HealthProvider = ProviderSourceRow;
+
+export interface SettingsPage extends CostSettings {
   share_login: boolean;
   wired: boolean;
   stash: StashMeta | null;
@@ -288,7 +399,7 @@ export interface SettingsPage {
 // ---- /admin/agents(§8.6,变更记录 30/32-②)----
 
 export function supportsWiring(id: string): boolean {
-  return id === "claude-code" || id === "opencode" || id === "codex";
+  return id === "claude-code" || id === "opencode" || id === "codex" || id === "gemini";
 }
 
 export interface AgentRow {
@@ -300,10 +411,50 @@ export interface AgentRow {
   drift: string | null;
   /** 残余用户动作(如 codex 的 export AUBRIDGE_TOKEN=...)。 */
   hint: string | null;
+  launch_command?: string | null;
   /** 当前使用模型(变更记录 32-②:编辑弹层数据源;opencode 为 null)。 */
   model: string | null;
   /** 本 agent token = aubridge-<id>,可复制。 */
   token: string | null;
+  discovery?: AgentDiscovery;
+  validation?: AgentValidationSummary;
+}
+
+export interface AgentDiscovery {
+  status: "not_checked" | "not_found" | "not_executable" | "version_unknown" | "version_unsupported" | "ready";
+  version?: string | null;
+  origin?: "override" | "path" | "known_location" | null;
+  observed_at?: number | null;
+}
+
+export type ValidationStatus = "queued" | "running" | "passed" | "failed" | "cancelled" | "timed_out";
+export interface AgentValidationSummary {
+  last_job_id?: string | null;
+  status: ValidationStatus | "not_run";
+  scope?: string | null;
+  observed_at?: number | null;
+  valid: boolean;
+  project_handle?: string | null;
+  project_alias?: string | null;
+}
+export interface AgentValidationJob {
+  job_id: string;
+  agent_id: string;
+  scope: string;
+  project_handle?: string | null;
+  project_alias?: string | null;
+  status: ValidationStatus;
+  reason?: string | null;
+  started_at?: number | null;
+  finished_at?: number | null;
+  evidence?: {
+    cli_version: string;
+    gateway_revision: string;
+    session_id: string;
+    requests: { request_id: string; provider: string; served_model: string; input_tokens?: number | null; output_tokens?: number | null }[];
+    tool_result_matched: boolean;
+    final_exact: boolean;
+  } | null;
 }
 
 export interface AgentsPage {
@@ -363,10 +514,13 @@ export interface DisconnectPreview {
 // ---- /admin/providers + /admin/keys(变更记录 32-①)----
 
 export interface ProviderSourceRow {
+  source_health?: SourceHealth;
   id: string;
   kind: string;
   models?: string[];
   base: string;
+  model_facts?: Record<string, ModelFacts>;
+  model_availability?: Record<string, boolean | null>;
   store_key: boolean;
   /** 仅报告 Key 是否存在，凭据值永不回显。 */
   key_set: boolean;
@@ -386,6 +540,51 @@ export interface ProviderSourceRow {
   resets_at?: number | null;
   /** preset / custom / plugin。 */
   source: string;
+  quota?: ProviderQuota | null;
+}
+
+export interface ModelFacts {
+  source?: "declared" | "vendor-directory";
+  name?: string | null;
+  context?: number | null;
+  output?: number | null;
+  tools?: boolean | null;
+  image_input?: boolean | null;
+  reasoning?: boolean | null;
+  reasoning_efforts?: string[];
+  input_modalities?: string[];
+  output_modalities?: string[];
+  protocol?: string | null;
+  observed_at?: number | null;
+  free_evidence: "unknown" | "declared-quota" | "vendor-zero-price" | "subscription";
+  price?: { input_per_million: number; output_per_million: number;
+    cache_read_per_million: number | null; cache_write_per_million: number | null } | null;
+}
+
+export interface ModelDirectory {
+  fetched_at: number | null;
+  checked_at?: number | null;
+  stale: boolean;
+  issue: string | null;
+  models: { id: string; facts: ModelFacts }[];
+}
+
+export interface ProviderQuota {
+  observed_at: number | null;
+  checked_at: number | null;
+  stale: boolean;
+  issue: "authentication" | "rate-limited" | "network" | "timeout" | "upstream" | "invalid-response" | "unsupported" | null;
+  revision: number;
+  history_unavailable: boolean;
+  windows: {
+    id: string;
+    span_secs: number;
+    used_percent: number;
+    resets_at: number | null;
+    observed_at: number;
+    source: "api" | "response-headers";
+    stale: boolean;
+  }[];
 }
 
 export interface ProviderCheck {
@@ -466,6 +665,7 @@ export interface QuotaPoint {
 export interface QuotaHistoryItem {
   provider: string;
   window: string;
+  legacy?: boolean;
   points: QuotaPoint[];
 }
 
@@ -478,7 +678,7 @@ export interface QuotaHistoryPage {
 export interface ModelGroup {
   name: string;
   members: string[];
-  /** free_first / free_only / sequential / round_robin(缺省 free_first)。 */
+  /** free_first / free_only / sequential / round_robin / smart / pace。 */
   rule: string;
 }
 
@@ -496,6 +696,11 @@ export interface ModelGroupPreview {
 // ---- /admin/gateway(变更记录 32-④,代理页)----
 
 export interface GatewayPage {
+  request_limits?: {
+    wire_body_bytes: number; decoded_body_bytes: number; body_read_timeout_secs: number;
+    admission_timeout_secs: number; max_requests: number; active_requests: number;
+    memory_budget_bytes: number; reserved_bytes: number; encodings: string[];
+  };
   serving: boolean;
   endpoint: string;
   admin_token: string;
@@ -503,3 +708,9 @@ export interface GatewayPage {
   requests?: DecisionRow[] | null;
   next?: string | null;
 }
+
+export interface BenchmarkMapping {
+  provider: string; model: string; target_provider: string; target_model: string;
+  source: string; version: string; observed_at: number; price: PriceSnapshot["price"];
+}
+export interface PricingPage { mappings: BenchmarkMapping[]; currency: string; unit: string }

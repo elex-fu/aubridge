@@ -1,0 +1,11 @@
+{
+  "scope": "sanitized recorded stream event shapes only; not product job, native metadata, session propagation, or GUI acceptance",
+  "official_cli_version": "0.70.0",
+  "source_receipt": ".local/iterations/0114/gemini070-case-r3-deb69dff46b6/receipt.json",
+  "source_receipt_sha256": "a432355ae57ea5421267371f27253e264174fb8eb5f12708eced5f06f6de10be",
+  "replaced": "all paths, session/tool IDs, timestamps, model labels, prompt/tool/final text, and statistics scalar values; event order, chunk count, fields and types retained",
+  "expected_final": {
+    "seed": "fixture-seed-xxxxxxxxxxxxxxxxx",
+    "resume": "fixture-resume-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+  }
+}

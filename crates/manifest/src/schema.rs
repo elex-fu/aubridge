@@ -26,6 +26,8 @@ pub struct Manifest {
     /// 已知上下文窗口，单位为 token。缺省表示未知。
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub context_windows: BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub model_facts: BTreeMap<String, crate::model::ModelFacts>,
     #[serde(default)]
     pub quota: QuotaDecl,
     #[serde(default)]
@@ -69,6 +71,8 @@ pub enum AuthKind {
     #[serde(alias = "api-key")]
     ApiKey,
     Bearer,
+    /// Native Claude Code subscription authentication; never an API credential.
+    ClaudeCli,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -136,6 +140,17 @@ pub fn validate(m: &Manifest) -> Vec<String> {
         if *window == 0 || !m.free_models.contains(model) {
             errs.push(format!(
                 "context_windows `{model}` 必须为已声明模型指定正数窗口"
+            ));
+        }
+    }
+    for (model, facts) in &m.model_facts {
+        if !m.free_models.contains(model)
+            || facts.context == Some(0)
+            || facts.output == Some(0)
+            || facts.price.as_ref().is_some_and(|price| !price.valid())
+        {
+            errs.push(format!(
+                "model_facts `{model}` 必须属于已声明模型且容量、价格有效"
             ));
         }
     }

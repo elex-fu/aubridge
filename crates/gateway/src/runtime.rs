@@ -83,6 +83,7 @@ impl Runtime {
             "aubridge",
         )
         .with_admin_token(new_admin_token()?)
+        .with_claude_cli()
         .with_opencode_api_auth(opencode_auth.clone())
         .with_codex_channel(
             ChatGptChannel::new(codex_dir.join("auth.json"), codex_dir.join("config.toml"))
@@ -107,7 +108,18 @@ impl Runtime {
         if desktop {
             state = state.with_desktop_access();
         }
+        state.refresh_claude_cli().await;
         let state = Arc::new(state);
+        let weak = Arc::downgrade(&state);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                let Some(state) = weak.upgrade() else {
+                    break;
+                };
+                state.refresh_claude_cli().await;
+            }
+        });
         let preferred_port = Settings::load_port(&config).unwrap_or_else(|| state.port());
         let listener = crate::bind_listener(&state, preferred_port).await?;
         match Settings::save_port(&config, state.port()) {
@@ -117,6 +129,9 @@ impl Runtime {
                 }
                 if let Err(error) = state.repair_opencode() {
                     eprintln!("aubridge: OpenCode 接线同步失败: {error}");
+                }
+                if let Err(error) = state.repair_gemini_port() {
+                    eprintln!("aubridge: Gemini CLI profile port repair failed: {error}");
                 }
                 if let Err(error) = state.repair_codex_port() {
                     eprintln!("aubridge: Codex profile 端口修复失败: {error}");
@@ -159,6 +174,7 @@ impl Runtime {
             tokio::select! {
                 result = &mut serving => result,
                 () = shutdown => {
+                    self.state.claude_cli.cancel_all();
                     let _ = begin_drain.send(());
                     match tokio::time::timeout(SHUTDOWN_GRACE, &mut serving).await {
                         Ok(result) => result,

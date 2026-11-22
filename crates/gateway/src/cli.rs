@@ -107,6 +107,43 @@ async fn status(data_dir: &Path) -> i32 {
     {
         Ok(response) if response.status().is_success() => {
             println!("网关运行中 {}", access.endpoint);
+            match client
+                .get(format!("{}/admin/build", access.endpoint))
+                .bearer_auth(&access.admin_token)
+                .send()
+                .await
+            {
+                Ok(response) if response.status().is_success() => {
+                    if let Ok(info) = response.json::<serde_json::Value>().await {
+                        println!(
+                            "构建 {} · {} · {} · {}",
+                            info["version"].as_str().unwrap_or("未知"),
+                            info["git_revision"].as_str().unwrap_or("提交未知"),
+                            info["mode"].as_str().unwrap_or("模式未知"),
+                            info["profile"].as_str().unwrap_or("profile 未知")
+                        );
+                        println!(
+                            "源码门禁：{}",
+                            if info["source_verified"] == true {
+                                "已验证"
+                            } else {
+                                "未附带验收标记"
+                            }
+                        );
+                        if let Some(capabilities) = info["capabilities"].as_array() {
+                            println!(
+                                "能力 {}",
+                                capabilities
+                                    .iter()
+                                    .filter_map(|value| value.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            );
+                        }
+                    }
+                }
+                _ => println!("构建信息不可读；旧版本可能尚未提供此接口"),
+            }
             0
         }
         Ok(response) => {

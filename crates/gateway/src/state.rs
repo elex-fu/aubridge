@@ -4,7 +4,10 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc, Mutex, RwLock,
+};
 
 use manifest::schema::{Manifest, ProviderKind};
 use manifest::state::{ModelCooldown, ProviderState};
@@ -17,19 +20,45 @@ use crate::chatgpt::{ChatGptChannel, LoginMetadata, LoginSnapshot, LoginSource};
 #[path = "opencode_keys.rs"]
 mod opencode_keys;
 
+#[path = "directory.rs"]
+pub(crate) mod directory;
+pub(crate) mod pricing;
+#[path = "quota.rs"]
+pub(crate) mod quota;
+#[path = "request_body.rs"]
+pub(crate) mod request_body;
+pub use request_body::{UpdateActivityLease, UpdateMaintenanceLease};
+#[path = "source_health.rs"]
+pub(crate) mod source_health;
+#[path = "usage_policy.rs"]
+pub(crate) mod usage_policy;
+#[path = "validation_evidence.rs"]
+mod validation_evidence;
+#[path = "work_config_backup.rs"]
+pub(crate) mod work_config_backup;
+
 pub(crate) type ConnectionVersion = Arc<()>;
 
 /// 快照 + 状态转移的共享宿主。registry 的完整形态(探活/轮询)M1
 /// 后续迭代,当前由 gateway 在每次失败/成功时就地转移。
 pub struct GatewayState {
+    pub(crate) agent_projects: crate::agent_project::ProjectService,
+    pub(crate) native_sessions: crate::native_sessions::Store,
+    backup: work_config_backup::BackupService,
+    pub(super) source_health: source_health::Observations,
+    pub(super) usage_policy: RwLock<usage_policy::UsagePolicy>,
+    pub(crate) agent_validation: crate::agent_validation::ValidationService,
+    pub(crate) compaction: Mutex<crate::compaction::State>,
     token: String,
     admin_token: String,
     desktop_access: bool,
-    ledger: Option<std::sync::Mutex<ledger::Ledger>>,
+    pub(crate) ledger: Option<std::sync::Mutex<ledger::Ledger>>,
     /// 每源 API key 缓存(keyring 预载 + set/clear 双写,变更记录
     /// 32-①):启动时全量 keyring 读一次进缓存,运行期取 key 零钥匙
     /// 串 IO;set/clear 同步刷缓存(保存即生效,免重启)。
     keys: RwLock<BTreeMap<String, String>>,
+    /// Restored custom connections never acquire an unconfirmed environment credential.
+    restored_keychain_only: RwLock<BTreeSet<String>>,
     opencode_api_auth: Option<PathBuf>,
     /// Last effective key, including an observed absence. Never persisted or logged.
     opencode_api_observed: Mutex<Option<Option<String>>>,
@@ -55,6 +84,8 @@ pub struct GatewayState {
     dirty: RwLock<BTreeSet<String>>,
     /// 决策和实际用量一起排队，避免两个视图看到不同的结算结果。
     pending_requests: Mutex<Vec<ledger::CompletedRequest>>,
+    /// D59: only this process can prove continuous retained coverage.
+    analytics_retention_since: AtomicU64,
     /// codex wham/usage 主动查询(§8.2 第二数据源;缓存 3min/负缓存
     /// 1min)。默认不挂——未登录/测试环境零外呼,由组装层显式接线。
     wham: Option<credentials::usage::WhamFetcher>,
@@ -64,8 +95,11 @@ pub struct GatewayState {
     plan_fetchers: RwLock<BTreeMap<String, std::sync::Arc<credentials::planquota::PlanFetcher>>>,
     openrouter: Option<credentials::usage::OpenRouterKeyFetcher>,
     openrouter_catalog: Option<OpenRouterCatalog>,
+    directories: directory::Directories,
+    admission: request_body::Admission,
     /// chatgpt 订阅凭据通道(§7:OAuth,不走 keys/keyring 注入)。
     chatgpt: Arc<ChatGptChannel>,
+    pub(crate) claude_cli: crate::claude_cli::Channel,
     /// 设置存储(§7 写回 opt-in,engineering-constraints B-7):
     /// (config.json 路径, stash 目录)。None = 未接线(测试默认态),
     /// 开关恒为只读。开关运行态在 chatgpt 通道里,持久化在这里。
@@ -75,6 +109,7 @@ pub struct GatewayState {
     cc_switch_db: Option<PathBuf>,
     settings_io: Mutex<()>,
     paused_providers: RwLock<BTreeSet<String>>,
+    claude_cli_enabled: AtomicBool,
     /// agent 接线路径(§8.6,变更记录 30):None = 未注入(测试
     /// 默认态/smoke 自检壳不碰用户真实配置),agents admin 路由
     /// 回"未配置"。接线器按需现建(`agents::wirings`)——端口
@@ -159,6 +194,12 @@ impl GatewayState {
     /// 注入 chatgpt 凭据通道(验收/测试;默认 `~/.codex/auth.json`)。
     pub fn with_codex_channel(mut self, channel: ChatGptChannel) -> Self {
         self.chatgpt = Arc::new(channel);
+        self
+    }
+
+    pub fn with_claude_cli(mut self) -> Self {
+        self.claude_cli =
+            crate::claude_cli::Channel::native().with_update_gate(self.admission.activity_gate());
         self
     }
 
@@ -274,6 +315,20 @@ impl GatewayState {
                 .iter()
                 .filter_map(|model| model.context.map(|window| (model.id.clone(), window)))
                 .collect();
+            manifest.model_facts = catalog
+                .models
+                .iter()
+                .map(|model| {
+                    let mut facts = model.facts.clone();
+                    facts.tools = Some(model.tools);
+                    facts.context = model.context;
+                    facts.protocol = Some(manifest::schema::WireProtocol::Chat);
+                    facts.free_evidence = manifest::model::FreeEvidence::VendorZeroPrice;
+                    facts.source = manifest::model::FactSource::VendorDirectory;
+                    facts.observed_at = Some(catalog.fetched_at);
+                    (model.id.clone(), facts)
+                })
+                .collect();
             source.models.clone_from(&manifest.free_models);
             source
                 .model_cooldowns
@@ -308,6 +363,16 @@ impl GatewayState {
             eprintln!("aubridge: 收紧本机凭据备份权限失败: {error}");
         }
         let s = credentials::settings::Settings::load(&config);
+        *self
+            .restored_keychain_only
+            .write()
+            .expect("restored credentials lock") = s.restored_keychain_only.clone();
+        *self.usage_policy.write().expect("cost policy lock") =
+            credentials::settings::Settings::load_checked(&config)
+                .map(|settings| usage_policy::UsagePolicy::from_settings(&settings))
+                .unwrap_or_else(|_| usage_policy::UsagePolicy::invalid());
+        self.claude_cli_enabled
+            .store(s.claude_cli_enabled, Ordering::SeqCst);
         // 来源判定用 load_checked(不复用吞错默认):读失败 fail-closed,
         // 无效值 fail-closed,空串(从未选择,含文件缺失)走首启
         // 自动判定——Codex 登录可读则 codex,否则 OpenCode openai
@@ -356,6 +421,7 @@ impl GatewayState {
                 Err(e) => eprintln!("aubridge: 自定义源 {} 装载失败,跳过: {e}", c.id),
             }
         }
+        self.load_model_selections(&s.model_selections);
         self
     }
 
@@ -423,6 +489,9 @@ impl GatewayState {
     /// 软开关切换(变更记录 32-④):不持久化,重启回默认开。
     pub fn set_serving(&self, on: bool) {
         self.serving.send_replace(on);
+        if !on {
+            self.claude_cli.cancel_all();
+        }
     }
 
     pub fn subscribe_serving(&self) -> tokio::sync::watch::Receiver<bool> {
@@ -458,8 +527,11 @@ impl GatewayState {
                         "name": w.name(),
                         "wired": w.wired(),
                         "detected": w.detected(),
+                        "discovery": crate::agent_validation::cached_discovery(self, w.id()),
+                        "validation": crate::agent_validation::summary(self, w.id()),
                         "drift": w.drift().as_ref().map(drift_str),
                         "hint": w.hint(),
+                        "launch_command": self.validation_launch_command(w.id()),
                         "model": w.current_model(),
                         "token": format!("{}-{}", token_key, w.id()),
                     })
@@ -502,6 +574,13 @@ impl GatewayState {
                 .disconnect_reviewed(preview)
                 .map_err(|error| error.to_string());
         }
+        if !on && id == "gemini" {
+            return self
+                .gemini_wiring()
+                .ok_or("Gemini CLI 接线未配置")?
+                .disconnect_reviewed(preview)
+                .map_err(|error| error.to_string());
+        }
         let models = self
             .models()
             .into_iter()
@@ -539,6 +618,24 @@ impl GatewayState {
         ))
     }
 
+    fn gemini_wiring(&self) -> Option<agents::gemini::GeminiCli> {
+        let paths = self.agents.as_ref()?;
+        Some(agents::gemini::GeminiCli::new(
+            paths.gemini_settings.clone(),
+            paths.gemini_env.clone(),
+            paths.state_dir.clone(),
+            self.port(),
+        ))
+    }
+
+    pub(crate) fn repair_gemini_port(&self) -> std::io::Result<()> {
+        let _guard = self.agents_io.lock().expect("agent config lock");
+        if let Some(wiring) = self.gemini_wiring() {
+            wiring.repair_port()?;
+        }
+        Ok(())
+    }
+
     fn managed_agent_models(&self) -> impl Iterator<Item = (&'static str, String)> {
         let claude = self
             .claude_wiring()
@@ -560,6 +657,12 @@ impl GatewayState {
             ("Claude Code (claude-code)", claude),
             ("Codex (codex)", codex),
             ("OpenCode (opencode)", opencode),
+            (
+                "Gemini CLI (gemini)",
+                self.gemini_wiring()
+                    .filter(|w| w.wired())
+                    .and_then(|w| w.current_model()),
+            ),
         ]
         .into_iter()
         .filter_map(|(client, model)| model.map(|model| (client, model)))
@@ -578,7 +681,8 @@ impl GatewayState {
                 paths.state_dir.clone(),
                 self.port(),
             )
-            .with_models(models),
+            .with_models(models)
+            .with_model_facts(self.model_facts()),
         )
     }
 
@@ -599,6 +703,10 @@ impl GatewayState {
             "codex" => self
                 .codex_wiring()
                 .ok_or("Codex 接线未配置")?
+                .disconnect_preview(),
+            "gemini" => self
+                .gemini_wiring()
+                .ok_or("Gemini CLI 接线未配置")?
                 .disconnect_preview(),
             _ => return Err("该 Agent 暂无断开预览".into()),
         }
@@ -631,8 +739,7 @@ impl GatewayState {
 
     /// 设置 agent 使用的模型(变更记录 32-②):模型合法性 = 自动
     /// 别名或网关已知模型;写该 agent 配置的目标字段。无单一模型
-    /// 字段的 agent(opencode/gemini)是 no-op 成功——UI 下拉在
-    /// 这两个 agent 上禁用,路由层不做区分。
+    /// 字段由对应接线器管理；Gemini 显式写 model.name。
     pub fn set_agent_model(&self, id: &str, model: &str) -> Result<(), String> {
         let Some(paths) = self.agents.as_ref() else {
             return Err("agent 接线未配置".to_string());
@@ -653,7 +760,7 @@ impl GatewayState {
             .ok_or_else(|| format!("未知 agent: {id}"))?;
         if let Some((members, rule)) = self
             .group_of(model)
-            .filter(|_| matches!(id, "claude-code" | "codex" | "opencode") && w.wired())
+            .filter(|_| matches!(id, "claude-code" | "codex" | "opencode" | "gemini") && w.wired())
         {
             let manifests = self.manifests.read().expect("manifests lock");
             if !group_has_supply(&manifests, &members, rule) {
@@ -695,12 +802,20 @@ impl GatewayState {
     /// base/key 状态/来源(preset|plugin|custom)。key 值永不出现。
     pub fn providers_overview(&self) -> Vec<serde_json::Value> {
         let manifests = self.manifests.read().expect("manifests lock").clone();
+        let snapshots: BTreeMap<_, _> = self
+            .snapshot()
+            .into_iter()
+            .map(|state| (state.id.clone(), state))
+            .collect();
         let custom = self.custom_ids.read().expect("custom_ids lock").clone();
         let plugin = self.plugin_ids.read().expect("plugin_ids lock").clone();
         let now = crate::upstream::unix_now();
         manifests
             .values()
             .map(|m| {
+                let mut effective=m.clone();
+                self.apply_directory(&mut effective);
+                let m=&effective;
                 let source = if custom.contains(&m.id) {
                     "custom"
                 } else if plugin.contains(&m.id) {
@@ -721,8 +836,7 @@ impl GatewayState {
                 // 余量即时值(quota-plan-design §3.3;曲线之外的
                 // Provider 页展示口径)。
                 let (util_5h, util_7d, resets_at) = {
-                    let providers = self.providers.read().expect("providers lock");
-                    match providers.get(&m.id) {
+                    match snapshots.get(&m.id) {
                         Some(state) => (state.util_5h, state.util_7d, state.resets_at),
                         None => (None, None, None),
                     }
@@ -770,9 +884,13 @@ impl GatewayState {
                     })
                     .collect::<Vec<_>>();
                 let mut row = serde_json::json!({
+                    "source_health": self.source_health(m, now),
                     "id": m.id,
                     "kind": m.kind,
                     "models": m.free_models,
+                    "model_facts": self.configured_model_facts(m),
+                    "model_availability": m.free_models.iter().map(|model|
+                        (model.clone(),self.directory_availability(m,model))).collect::<BTreeMap<_,_>>(),
                     "base": m.provider.base,
                     "store_key": m.permissions.store_key,
                     "key_set": key_set,
@@ -783,12 +901,18 @@ impl GatewayState {
                     "util_5h": util_5h,
                     "util_7d": util_7d,
                     "resets_at": resets_at,
+                    "quota": snapshots.get(&m.id).map(|state|state.quota.view(now)),
                     "free_requests": free_requests,
                     "routing_status": routing_status,
                     "source": source,
                     "model_discovery_supported": custom.contains(&m.id)
                         && m.provider.protocol == manifest::schema::WireProtocol::Chat,
                 });
+                if crate::claude_cli::owns(m) {
+                    row["login_source"] = serde_json::json!("official_claude_cli");
+                    row["transport"] = serde_json::json!("claude_cli");
+                    row["subscription_type"] = serde_json::Value::Null;
+                }
                 if self.chatgpt.owns(m) {
                     row["login_source"] = serde_json::json!(self.chatgpt.login_source());
                 }
@@ -864,6 +988,7 @@ impl GatewayState {
             return Err(format!("源 {id} 不是自定义源"));
         }
         let mut settings = settings_for_edit(config)?;
+        settings.model_selections.remove(id);
         let stored = settings
             .providers
             .iter_mut()
@@ -945,6 +1070,7 @@ impl GatewayState {
         let mut s = settings_for_edit(config)?;
         self.check_custom_provider_supply(id, None)?;
         s.providers.retain(|p| p.id != id);
+        s.restored_keychain_only.remove(id);
         s.paused_providers.remove(id);
         let mut manifests = self.manifests.write().expect("manifests lock");
         let mut versions = self
@@ -961,6 +1087,10 @@ impl GatewayState {
         self.custom_ids.write().expect("custom_ids lock").remove(id);
         self.providers.write().expect("providers lock").remove(id);
         manifests.remove(id);
+        self.restored_keychain_only
+            .write()
+            .expect("restored credentials lock")
+            .remove(id);
         versions.remove(id);
         self.paused_providers
             .write()
@@ -1016,11 +1146,19 @@ impl GatewayState {
         }
     }
 
+    pub(crate) async fn refresh_claude_cli(&self) {
+        self.claude_cli
+            .refresh(|| !self.provider_paused(crate::claude_cli::ID))
+            .await;
+    }
+
     pub(crate) fn provider_paused(&self, id: &str) -> bool {
-        self.paused_providers
-            .read()
-            .expect("paused providers lock")
-            .contains(id)
+        (id == crate::claude_cli::ID && !self.claude_cli_enabled.load(Ordering::SeqCst))
+            || self
+                .paused_providers
+                .read()
+                .expect("paused providers lock")
+                .contains(id)
     }
 
     pub(crate) fn set_provider_paused(&self, id: &str, paused: bool) -> Result<(), String> {
@@ -1032,6 +1170,9 @@ impl GatewayState {
             return Err(format!("未知源: {id}"));
         }
         let mut settings = settings_for_edit(config)?;
+        if id == crate::claude_cli::ID {
+            settings.claude_cli_enabled = !paused;
+        }
         if paused {
             settings.paused_providers.insert(id.into());
         } else {
@@ -1040,10 +1181,17 @@ impl GatewayState {
         settings
             .save(config)
             .map_err(|e| format!("持久化失败: {e}"))?;
+        let was_enabled = self
+            .claude_cli_enabled
+            .swap(settings.claude_cli_enabled, Ordering::SeqCst);
         *self
             .paused_providers
             .write()
             .expect("paused providers lock") = settings.paused_providers;
+        if (was_enabled && !settings.claude_cli_enabled) || (id == crate::claude_cli::ID && paused)
+        {
+            self.claude_cli.cancel_all();
+        }
         Ok(())
     }
 
@@ -1148,7 +1296,7 @@ impl GatewayState {
         }
         let Some(rule) = router::GroupRule::parse(&g.rule) else {
             return Err(format!(
-                "未知规则: {}(free_first/free_only/sequential/round_robin)",
+                "未知规则: {}(free_first/free_only/sequential/round_robin/smart/pace)",
                 g.rule
             ));
         };
@@ -1250,6 +1398,17 @@ impl GatewayState {
         self.chatgpt.metadata()
     }
 
+    /// Native sealed history uses the same login-source-aware owner as formal dispatch.
+    pub(crate) fn current_compaction_subject(&self, manifest: &Manifest) -> Option<String> {
+        if self.chatgpt.owns(manifest) {
+            self.chatgpt
+                .quota_snapshot()
+                .map(|login| login.compaction_subject())
+        } else {
+            self.current_quota_subject(manifest)
+        }
+    }
+
     pub fn set_chatgpt_login_source(&self, source: LoginSource) -> Result<(), String> {
         let Some((config, _)) = &self.settings else {
             return Err("设置存储未接线".to_string());
@@ -1304,52 +1463,6 @@ impl GatewayState {
     pub fn stash_meta(&self) -> Option<credentials::stash::StashMeta> {
         let (_, stash_dir) = self.settings.as_ref()?;
         credentials::stash::meta(stash_dir)
-    }
-
-    /// codex wham/usage 主动查询(§8.2 第二数据源,仪表盘触发):仅
-    /// Responses 协议源 + 凭据可用时查,结果合并进源状态。v1 口径
-    /// (变更记录 19):主动查询只补利用率与重置时刻,rest 决策仍由
-    /// 被动采样/失败路径驱动。
-    pub async fn sample_wham_usage(&self) {
-        let Some(wham) = &self.wham else {
-            return;
-        };
-        let ids: Vec<String> = {
-            let manifests = self.manifests.read().expect("manifests lock");
-            manifests
-                .values()
-                .filter(|m| self.chatgpt.owns(m))
-                .map(|m| m.id.clone())
-                .collect()
-        };
-        if ids.is_empty() {
-            return;
-        }
-        let Some(tokens) = self.chatgpt_ready().await else {
-            return;
-        };
-        let http = self.http().clone();
-        let Some(usage) = wham.fetch(&http, &tokens.access_token).await else {
-            return;
-        };
-        let Some(rl) = usage.rate_limit else {
-            return;
-        };
-        let w5h = rl.secondary_window.as_ref().and_then(|w| w.used_percent);
-        let w7d = rl.primary_window.as_ref().and_then(|w| w.used_percent);
-        let reset = rl
-            .secondary_window
-            .as_ref()
-            .and_then(|w| w.reset_at)
-            .or_else(|| rl.primary_window.as_ref().and_then(|w| w.reset_at))
-            .filter(|t| *t >= 0)
-            .map(|t| t as u64);
-        for id in &ids {
-            self.record_utilization(id, w5h, w7d);
-            if let Some(r) = reset {
-                self.apply_reset_sample(id, r);
-            }
-        }
     }
 
     /// 发送前取 chatgpt 凭据(含主动刷新判定,§7)。
@@ -1535,12 +1648,23 @@ impl GatewayState {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("build gateway HTTP client");
+        let admission = request_body::Admission::default();
+        let claude_cli =
+            crate::claude_cli::Channel::default().with_update_gate(admission.activity_gate());
         Self {
+            agent_validation: Default::default(),
+            usage_policy: Default::default(),
+            source_health: Default::default(),
+            backup: Default::default(),
+            native_sessions: Default::default(),
+            agent_projects: Default::default(),
+            compaction: Mutex::new(crate::compaction::State::default()),
             token: token.to_string(),
             admin_token: format!("{token}-admin"),
             desktop_access: false,
             ledger: None,
             keys: RwLock::new(keys),
+            restored_keychain_only: Default::default(),
             opencode_api_auth: None,
             opencode_api_observed: Mutex::new(None),
             key_store: None,
@@ -1552,15 +1676,20 @@ impl GatewayState {
             sticks: RwLock::new(BTreeMap::new()),
             dirty: RwLock::new(BTreeSet::new()),
             pending_requests: Mutex::new(Vec::new()),
+            analytics_retention_since: AtomicU64::new(crate::upstream::unix_now()),
             wham: None,
             plan_fetchers: RwLock::new(BTreeMap::new()),
             openrouter: None,
             openrouter_catalog: None,
+            directories: directory::Directories::default(),
+            admission,
             chatgpt,
+            claude_cli,
             settings: None,
             cc_switch_db: None,
             settings_io: Mutex::new(()),
             paused_providers: RwLock::new(BTreeSet::new()),
+            claude_cli_enabled: AtomicBool::new(false),
             agents: None,
             agents_io: Mutex::new(()),
             custom_ids: RwLock::new(BTreeSet::new()),
@@ -1590,6 +1719,12 @@ impl GatewayState {
     /// 挂账本(仪表盘数据源 + router 运行态持久化宿主):挂载即
     /// 载入上次落盘的 rest/sink/亲和(§8.1/§8.4,重启不丢)。
     pub fn with_ledger(mut self, l: ledger::Ledger) -> Self {
+        if let Some((config, _)) = &self.settings {
+            if let Ok(settings) = credentials::settings::Settings::load_checked(config) {
+                self.load_model_selections(&settings.model_selections);
+            }
+        }
+        self.load_directories(&l);
         if let Some(catalog) = &self.openrouter_catalog {
             let cached = l.load_provider_catalog("openrouter");
             match cached {
@@ -1686,6 +1821,8 @@ impl GatewayState {
         }
         let mut pending = self.pending_requests.lock().expect("pending requests lock");
         if pending.len() >= PENDING_REQUESTS_CAP {
+            self.analytics_retention_since
+                .fetch_max(crate::upstream::unix_now(), Ordering::SeqCst);
             pending.remove(0);
         }
         pending.push(request);
@@ -1703,7 +1840,69 @@ impl GatewayState {
             .clear_request_history(&pending)
             .map_err(|error| format!("清空请求历史失败 · {error}"))?;
         pending.clear();
+        self.analytics_retention_since
+            .fetch_max(crate::upstream::unix_now(), Ordering::SeqCst);
         Ok(deleted)
+    }
+
+    /// D59: no flush, provider sampling, or mutation while reading analytics.
+    pub(crate) fn analytics_report(
+        &self,
+        start: &str,
+        end: &str,
+        compare_previous: bool,
+    ) -> Result<ledger::AnalyticsReport, ledger::AnalyticsError> {
+        let ledger = self
+            .ledger
+            .as_ref()
+            .ok_or(ledger::AnalyticsError::Storage)?
+            .lock()
+            .map_err(|_| ledger::AnalyticsError::Storage)?;
+        // Freeze the as-of context briefly; aggregation must not block request settlement.
+        let (now, retention_since, timestamps, active_inference) = {
+            let pending = self
+                .pending_requests
+                .lock()
+                .map_err(|_| ledger::AnalyticsError::Storage)?;
+            let timestamps: Vec<u64> = pending
+                .iter()
+                .flat_map(|request| {
+                    std::iter::once(request.decision.ts)
+                        .chain(request.usage.iter().map(|usage| usage.ts))
+                })
+                .collect();
+            (
+                crate::upstream::unix_now(),
+                self.analytics_retention_since.load(Ordering::SeqCst),
+                timestamps,
+                self.admission.has_active_inference(),
+            )
+        };
+        ledger.analytics(
+            start,
+            end,
+            compare_previous,
+            ledger::AnalyticsContext {
+                now,
+                retention_since,
+                pending_timestamps: &timestamps,
+                active_inference,
+            },
+        )
+    }
+
+    pub(crate) fn analytics_decision_page(
+        &self,
+        start: &str,
+        end: &str,
+        filter: ledger::DecisionFilter<'_>,
+    ) -> Result<ledger::DecisionPage, ledger::AnalyticsError> {
+        self.ledger
+            .as_ref()
+            .ok_or(ledger::AnalyticsError::Storage)?
+            .lock()
+            .map_err(|_| ledger::AnalyticsError::Storage)?
+            .decision_page_in_range(filter, 20, start, end, crate::upstream::unix_now())
     }
 
     /// 仪表盘最近 20 条请求；账本未配置或读取失败时不可用。
@@ -1749,6 +1948,26 @@ impl GatewayState {
             .and_then(|l| l.lock().expect("ledger lock").monthly_savings_opt().ok())
     }
 
+    pub(crate) fn session_page(
+        &self,
+        agent: Option<&str>,
+        session: Option<&str>,
+        before: Option<(u64, i64)>,
+    ) -> Option<ledger::SessionPage> {
+        self.flush_router_state();
+        self.ledger
+            .as_ref()?
+            .lock()
+            .ok()?
+            .session_page(agent, session, before, 20)
+            .ok()
+    }
+
+    pub(crate) fn monthly_value(&self) -> Option<ledger::ValueSummary> {
+        self.flush_router_state();
+        self.ledger.as_ref()?.lock().ok()?.monthly_value().ok()
+    }
+
     /// 源 key:钥匙串缓存优先，环境变量作为开发注入路径。
     pub fn api_key_opt(&self, id: &str) -> Option<String> {
         self.resolve_api_key(id).0
@@ -1767,6 +1986,14 @@ impl GatewayState {
     ) -> (Option<String>, &'static str) {
         if let Some(k) = self.keys.read().expect("keys lock").get(id) {
             return (Some(k.clone()), "saved");
+        }
+        if self
+            .restored_keychain_only
+            .read()
+            .expect("restored credentials lock")
+            .contains(id)
+        {
+            return (None, "none");
         }
         let env = format!("KEY_{}", id.to_uppercase().replace('-', "_"));
         if let Ok(key) = std::env::var(env) {
@@ -1911,6 +2138,25 @@ impl GatewayState {
         }
     }
 
+    pub(crate) fn update_bound_connection(
+        &self,
+        id: &str,
+        version: Option<&ConnectionVersion>,
+        login: Option<&LoginSnapshot>,
+        cli_epoch: Option<&Arc<()>>,
+        update: impl FnOnce(),
+    ) {
+        self.update_current_connection(id, version, || {
+            if id == crate::claude_cli::ID {
+                self.claude_cli.update_bound(cli_epoch, update);
+            } else if let Some(login) = login {
+                self.chatgpt.update_current_quota_login(login, update);
+            } else {
+                update();
+            }
+        });
+    }
+
     /// key 是否可用(Provider 行"已设置"口径:缓存或 env 有值即
     /// 已设置——对用户语义是"这个源有凭据",来源不区分)。
     pub fn key_set(&self, id: &str) -> bool {
@@ -1996,29 +2242,38 @@ impl GatewayState {
     }
 
     pub fn manifest(&self, id: &str) -> Option<Manifest> {
-        self.manifests
+        let mut manifest = self
+            .manifests
             .read()
             .expect("manifests lock")
             .get(id)
-            .cloned()
+            .cloned()?;
+        self.apply_directory(&mut manifest);
+        Some(manifest)
     }
 
     pub fn snapshot(&self) -> Vec<ProviderState> {
-        self.providers
-            .read()
-            .expect("providers lock")
-            .values()
-            .cloned()
+        self.routing_sources()
+            .into_iter()
+            .map(|(source, _)| source)
             .collect()
     }
 
     pub(crate) fn routing_sources(&self) -> Vec<(ProviderState, Manifest)> {
-        let manifests = self.manifests.read().expect("manifests lock");
-        let providers = self.providers.read().expect("providers lock");
-        providers
-            .values()
-            .filter_map(|source| Some((source.clone(), manifests.get(&source.id)?.clone())))
-            .collect()
+        let mut sources: Vec<_> = {
+            let manifests = self.manifests.read().expect("manifests lock");
+            self.providers
+                .read()
+                .expect("providers lock")
+                .values()
+                .filter_map(|source| Some((source.clone(), manifests.get(&source.id)?.clone())))
+                .collect()
+        };
+        for (source, manifest) in &mut sources {
+            self.bind_quota_identity(source, manifest);
+            self.apply_directory(manifest);
+        }
+        sources
     }
 
     /// 网关聚合模型清单(OpenCode with_models 与 agents 页下拉共用)。
@@ -2038,11 +2293,16 @@ impl GatewayState {
     /// manifests 聚合的字面模型(sort + dedup,不含自动别名/分组名)。
     fn literal_models(&self) -> Vec<String> {
         let mut models: Vec<String> = self
-            .manifests
-            .read()
-            .expect("manifests lock")
-            .values()
-            .flat_map(|m| m.free_models.iter().cloned())
+            .routing_sources()
+            .into_iter()
+            .flat_map(|(_, manifest)| {
+                manifest
+                    .free_models
+                    .iter()
+                    .filter(|model| self.directory_availability(&manifest, model) != Some(false))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
             .collect();
         models.sort();
         models.dedup();
@@ -2144,6 +2404,19 @@ impl GatewayState {
                 None,
             ));
         }
+        let manifest = {
+            self.manifests
+                .read()
+                .expect("manifests lock")
+                .get(id)
+                .cloned()
+        };
+        if manifest
+            .as_ref()
+            .is_some_and(|manifest| self.directory_availability(manifest, model) == Some(false))
+        {
+            return Some(crate::route_plan::Block::new("model-not-listed", None));
+        }
         let providers = self.providers.read().expect("providers lock");
         match providers.get(id) {
             Some(source) if source.models.iter().any(|id| id == model) => {
@@ -2234,64 +2507,6 @@ impl GatewayState {
                 let _ = ledger.note_quota_point(id, window, 100.0 - used, resets_at, now);
             }
         }
-    }
-
-    /// key plan 配额查询(quota-plan-design §3.2;wham 同构):
-    /// 遍历命中 plan_source 分发的源,有 key 才查;结果并入
-    /// util/resets 字段——被动采样同款落点,历史顺带入账。
-    /// v1 口径:查询只补利用率与重置时刻,rest 决策仍由 429 路径
-    /// 驱动(不做池化调度,§3 反目标)。
-    pub async fn sample_plan_quotas(&self) {
-        // (源 id, key, 端点, 鉴权形态);端点+形态作 fetcher 缓存键。
-        let jobs: Vec<(String, String, String, credentials::planquota::PlanAuth)> = {
-            let manifests = self.manifests.read().expect("manifests lock");
-            let keys = self.keys.read().expect("keys lock");
-            manifests
-                .values()
-                .filter_map(|m| {
-                    let key = keys.get(&m.id)?; // 无 key = 无可查的 plan
-                    let (endpoint, auth) = credentials::planquota::plan_source(&m.provider.base)?;
-                    Some((m.id.clone(), key.clone(), endpoint, auth))
-                })
-                .collect()
-        };
-        if jobs.is_empty() {
-            return;
-        }
-        let http = self.http().clone();
-        for (id, key, endpoint, auth) in jobs {
-            let fetcher = {
-                let mut fetchers = self.plan_fetchers.write().expect("plan fetchers lock");
-                std::sync::Arc::clone(
-                    fetchers
-                        .entry(format!("{endpoint}|{auth:?}"))
-                        .or_insert_with(|| {
-                            std::sync::Arc::new(credentials::planquota::PlanFetcher::new(
-                                endpoint.clone(),
-                                auth,
-                            ))
-                        }),
-                )
-            };
-            let Some(windows) = fetcher.fetch(&http, &key).await else {
-                continue;
-            };
-            // reset 先落(记录路径读 ProviderState 快照,先写 reset
-            // 才能让历史点带上本轮 reset;与 x-codex 被动采样同序)。
-            if let Some(reset) = windows.reset_at {
-                self.apply_reset_sample(&id, reset);
-            }
-            self.record_utilization(&id, windows.w5h, windows.w7d);
-        }
-    }
-
-    /// 配额窗口历史查询(UI 曲线;未挂 ledger → 空表)。
-    pub fn quota_history(&self, provider: Option<&str>, since: u64) -> Vec<ledger::QuotaPointRow> {
-        self.ledger
-            .as_ref()
-            .and_then(|l| l.lock().ok())
-            .and_then(|l| l.quota_history(provider, since).ok())
-            .unwrap_or_default()
     }
 
     /// 会话亲和条目查询(§8.4;调用方负责冷窗与重排决策)。
@@ -2514,5 +2729,82 @@ mod tests {
             state.keys.read().unwrap().get("gated").map(String::as_str),
             Some("fixture-key")
         );
+    }
+}
+
+#[cfg(test)]
+mod analytics_context_tests {
+    use super::*;
+
+    fn state() -> GatewayState {
+        GatewayState::from_manifests(BTreeMap::new(), "analytics-context")
+            .with_ledger(ledger::Ledger::open(":memory:").unwrap())
+    }
+
+    fn completed(ts: u64) -> ledger::CompletedRequest {
+        ledger::CompletedRequest {
+            decision: ledger::DecisionRecord {
+                ts,
+                outcome: "ok".into(),
+                attempts: "[]".into(),
+                ..Default::default()
+            },
+            usage: vec![ledger::UsageRecord {
+                ts,
+                ..Default::default()
+            }],
+        }
+    }
+
+    #[test]
+    fn analytics_read_keeps_pending_unsettled_and_does_not_flush() {
+        let state = state();
+        let window = state
+            .ledger
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .analytics_window("2020-01-01", "2020-01-02", crate::upstream::unix_now())
+            .unwrap();
+        state.analytics_retention_since.store(0, Ordering::SeqCst);
+        state.record_request(completed(window.start_ts));
+        let report = state
+            .analytics_report("2020-01-01", "2020-01-02", true)
+            .unwrap();
+        let report = serde_json::to_value(report).unwrap();
+        assert_eq!(report["summary"]["requests"]["total"], 0);
+        assert_eq!(
+            report["comparison"]["requests_change"]["reason"],
+            "pending_settlement"
+        );
+        assert_eq!(state.pending_requests.lock().unwrap().len(), 1);
+        assert!(state
+            .ledger
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .recent_decisions(20)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn loss_and_successful_clear_advance_observation_boundary() {
+        let state = state();
+        state.analytics_retention_since.store(0, Ordering::SeqCst);
+        for _ in 0..=PENDING_REQUESTS_CAP {
+            state.record_request(completed(1));
+        }
+        assert_eq!(
+            state.pending_requests.lock().unwrap().len(),
+            PENDING_REQUESTS_CAP
+        );
+        assert!(state.analytics_retention_since.load(Ordering::SeqCst) > 0);
+        state.analytics_retention_since.store(0, Ordering::SeqCst);
+        state.clear_request_history().unwrap();
+        assert!(state.analytics_retention_since.load(Ordering::SeqCst) > 0);
+        assert!(state.pending_requests.lock().unwrap().is_empty());
     }
 }

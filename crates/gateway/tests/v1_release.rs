@@ -1478,6 +1478,8 @@ async fn clear_request_history_discards_decisions_but_keeps_pending_usage() {
                 input_tokens: Some(10),
                 output_tokens: Some(5),
                 accounting: ledger::Accounting::Reported,
+                price_snapshot: ledger::PriceSnapshot::builtin(MODEL),
+                ..Default::default()
             }],
         }])
         .unwrap();
@@ -1524,6 +1526,7 @@ async fn clear_request_history_discards_decisions_but_keeps_pending_usage() {
     let history = latest(&client, &base).await;
     assert_eq!(history["recent_decisions"], json!([]));
     let reader = ledger::Ledger::open(&db).unwrap();
+    assert_eq!(reader.value_summary(0, i64::MAX as u64).unwrap().records, 2);
     let (total, by_provider) = reader.monthly_savings(0, i64::MAX as u64).unwrap();
     assert_eq!(by_provider.len(), 2);
     assert!((total - (15 + new_tokens) as f64 * 0.11 / 1e6).abs() < 1e-12);
@@ -3747,6 +3750,8 @@ fn catalog_model(id: &str, tools: bool) -> Value {
 
 #[tokio::test]
 async fn directory_filters_models_retains_groups_and_survives_a_failed_refresh_and_restart() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     const WITH_TOOLS: &str = "vendor/tool-model:free";
     const TEXT_ONLY: &str = "vendor/text-model:free";
     const STATIC: &str = "vendor/old-static:free";
@@ -3762,14 +3767,19 @@ async fn directory_filters_models_retains_groups_and_survives_a_failed_refresh_a
         catalog_model("vendor/ambiguous:free", true), catalog_model("vendor/ambiguous:free", false),
     ]});
     let directory = Arc::new(std::sync::Mutex::new(full.clone()));
+    let directory_calls = Arc::new(AtomicUsize::new(0));
     let (directory_base, directory_task) = http_app(Router::new().route(
         "/models",
         axum::routing::get({
             let directory = directory.clone();
-            move |headers: HeaderMap| async move {
-                assert!(!headers.contains_key("authorization"));
-                assert!(!headers.contains_key("x-api-key"));
-                axum::Json(directory.lock().unwrap().clone())
+            let directory_calls = directory_calls.clone();
+            move |headers: HeaderMap| {
+                directory_calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    assert!(!headers.contains_key("authorization"));
+                    assert!(!headers.contains_key("x-api-key"));
+                    axum::Json(directory.lock().unwrap().clone())
+                }
             }
         }),
     ))
@@ -3787,6 +3797,7 @@ async fn directory_filters_models_retains_groups_and_survives_a_failed_refresh_a
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let settings = dir.join("config.json");
+    std::fs::write(&settings, r#"{"future_fixture_setting":true}"#).unwrap();
     let database = dir.join("ledger.sqlite");
     let opencode = dir.join("opencode.jsonc");
     let agent_state = dir.join("agents");
@@ -3828,6 +3839,32 @@ async fn directory_filters_models_retains_groups_and_survives_a_failed_refresh_a
         .error_for_status()
         .unwrap();
     assert!(std::fs::read_to_string(&opencode).unwrap().contains(STATIC));
+    let before_read_settings = std::fs::read(&settings).unwrap();
+    let before_read_opencode = std::fs::read(&opencode).unwrap();
+    let unauthorized_read = client
+        .get(format!("{base}/admin/{catalog}"))
+        .bearer_auth("aubridge-opencode")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauthorized_read.status(), StatusCode::UNAUTHORIZED);
+    for _ in 0..2 {
+        let response = client
+            .get(format!("{base}/admin/{catalog}"))
+            .bearer_auth("aubridge-admin")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let cached: Value = response.json().await.unwrap();
+        assert_eq!(cached["fetched_at"], Value::Null);
+        assert_eq!(cached["checked_at"], Value::Null);
+        assert_eq!(cached["models"], json!([]));
+        assert_eq!(cached["stale"], true);
+        assert_eq!(directory_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(std::fs::read(&settings).unwrap(), before_read_settings);
+        assert_eq!(std::fs::read(&opencode).unwrap(), before_read_opencode);
+    }
     let unauthorized = client
         .post(format!("{base}/admin/{catalog}"))
         .bearer_auth("aubridge-opencode")
@@ -3842,18 +3879,57 @@ async fn directory_filters_models_retains_groups_and_survives_a_failed_refresh_a
         .json()
         .await
         .unwrap();
+    assert_eq!(directory_calls.load(Ordering::SeqCst), 1);
     assert_eq!(view["issue"], Value::Null);
     assert_eq!(view.get("opencode_issue"), Some(&Value::Null));
     let synced = std::fs::read_to_string(&opencode).unwrap();
     assert!(synced.contains(WITH_TOOLS) && synced.contains(TEXT_ONLY) && !synced.contains(STATIC));
     assert!(synced.contains("// fixture preference"));
     assert_eq!(
-        view["models"],
-        json!([
-            {"id":TEXT_ONLY,"tools":false,"context":65536},
-            {"id":WITH_TOOLS,"tools":true,"context":65536},
-        ])
+        view["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(
+                |model| json!({"id":model["id"],"tools":model["tools"],"context":model["context"]})
+            )
+            .collect::<Vec<_>>(),
+        vec![
+            json!({"id":TEXT_ONLY,"tools":false,"context":65536}),
+            json!({"id":WITH_TOOLS,"tools":true,"context":65536}),
+        ]
     );
+
+    let after_refresh_settings = std::fs::read(&settings).unwrap();
+    let after_refresh_opencode = std::fs::read(&opencode).unwrap();
+    let cached_response = client
+        .get(format!("{base}/admin/{catalog}"))
+        .bearer_auth("aubridge-admin")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cached_response.status(), StatusCode::OK);
+    let cached_view: Value = cached_response.json().await.unwrap();
+    assert_eq!(cached_view["fetched_at"], view["fetched_at"]);
+    assert_eq!(cached_view["checked_at"], view["fetched_at"]);
+    assert_eq!(cached_view["stale"], false);
+    assert_eq!(
+        cached_view["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|model| &model["id"])
+            .collect::<Vec<_>>(),
+        view["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|model| &model["id"])
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(directory_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(std::fs::read(&settings).unwrap(), after_refresh_settings);
+    assert_eq!(std::fs::read(&opencode).unwrap(), after_refresh_opencode);
 
     // Only discount is metadata. Other pricing fields must still describe
     // exact zero cost, including prices too small for floating-point checks.
@@ -4165,9 +4241,13 @@ async fn directory_without_recognizable_prices_preserves_last_snapshot() {
     let (client, base, task) = gateway(state()).await;
     let initial = refresh(&client, &base).await;
     assert!(initial["issue"].is_null());
+    assert_eq!(initial["models"].as_array().unwrap().len(), 1);
+    assert_eq!(initial["models"][0]["id"], FIRST);
+    assert_eq!(initial["models"][0]["tools"], true);
+    assert_eq!(initial["models"][0]["context"], 65536);
     assert_eq!(
-        initial["models"],
-        json!([{"id":FIRST,"tools":true,"context":65536}])
+        initial["models"][0]["facts"]["free_evidence"],
+        "vendor-zero-price"
     );
     let reader = ledger::Ledger::open(&db).unwrap();
     let saved = reader.load_provider_catalog("openrouter").unwrap().unwrap();
@@ -4228,10 +4308,10 @@ async fn directory_without_recognizable_prices_preserves_last_snapshot() {
     let updated = refresh(&client, &base).await;
     assert!(updated["issue"].is_null());
     assert_eq!(updated["stale"], false);
-    assert_eq!(
-        updated["models"],
-        json!([{"id":NEXT,"tools":false,"context":65536}])
-    );
+    assert_eq!(updated["models"].as_array().unwrap().len(), 1);
+    assert_eq!(updated["models"][0]["id"], NEXT);
+    assert_eq!(updated["models"][0]["tools"], false);
+    assert_eq!(updated["models"][0]["context"], 65536);
 
     let mut tiny = catalog_model("vendor/tiny:free", true);
     tiny["pricing"]["completion"] = json!("1e-999");
@@ -4621,11 +4701,16 @@ async fn native_anthropic_partial_usage_counts_only_reported_tokens() {
         assert_eq!(decision["outcome"], outcome);
         assert_eq!(decision["input_tokens"], json!(input));
         assert_eq!(decision["output_tokens"], json!(output));
-        let actual = dashboard["monthly_savings_usd"].as_f64().unwrap();
-        assert!(
-            (actual - expected_cost).abs() < 1e-12,
-            "{model} {outcome}: {actual}"
-        );
+        if model == "unpriced-model" {
+            assert!(dashboard["monthly_savings_usd"].is_null());
+            assert_eq!(dashboard["value_summary"]["unpriced_records"], 1);
+        } else {
+            let actual = dashboard["monthly_savings_usd"].as_f64().unwrap();
+            assert!(
+                (actual - expected_cost).abs() < 1e-12,
+                "{model} {outcome}: {actual}"
+            );
+        }
 
         let persisted = ledger::Ledger::open(&db)
             .unwrap()

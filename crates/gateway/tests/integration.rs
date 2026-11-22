@@ -243,9 +243,11 @@ async fn dashboard_requires_admin_key_and_reports_savings() {
         agent: "claude-code".into(),
         provider: "zhipu".into(),
         model: "glm-4.5-flash".into(),
+        price_snapshot: ledger::PriceSnapshot::builtin("glm-4.5-flash"),
         input_tokens: Some(1_000_000),
         output_tokens: Some(0),
         accounting: Accounting::Reported,
+        ..UsageRecord::default()
     })
     .unwrap();
 
@@ -292,7 +294,7 @@ async fn dashboard_requires_admin_key_and_reports_savings() {
     assert!((v["monthly_savings_usd"].as_f64().unwrap() - 0.11).abs() < 1e-9);
     assert_eq!(v["top_providers"][0]["provider"], "zhipu");
     let card = v["share_card"].as_str().unwrap();
-    assert!(card.contains("本月省了 $0.1"));
+    assert!(card.contains("API 等值估算 $0.11"));
     assert!(card.contains("对标口径"));
 
     server.abort();
@@ -2507,11 +2509,11 @@ async fn cors_only_admits_the_desktop_origin_with_the_right_key() {
     );
     assert_eq!(
         pre.headers()["access-control-allow-headers"],
-        "authorization, content-type, x-api-key"
+        "authorization, content-type, x-api-key, x-goog-api-key"
     );
     assert_eq!(
         pre.headers()["access-control-expose-headers"],
-        "x-aubridge-provider"
+        "x-aubridge-provider, x-aubridge-request-id"
     );
     let accepted = client
         .get(format!("{gw}/admin/dashboard"))
@@ -2576,7 +2578,7 @@ async fn cors_only_admits_the_desktop_origin_with_the_right_key() {
     assert_eq!(inferred.headers()["x-aubridge-provider"], "test-source");
     assert_eq!(
         inferred.headers()["access-control-expose-headers"],
-        "x-aubridge-provider"
+        "x-aubridge-provider, x-aubridge-request-id"
     );
     assert_eq!(
         inferred.json::<serde_json::Value>().await.unwrap()["content"][0]["text"],

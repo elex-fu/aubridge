@@ -17,6 +17,11 @@ pub(crate) struct Model {
     pub id: String,
     pub tools: bool,
     pub context: Option<u64>,
+    #[serde(default)]
+    pub facts: manifest::model::ModelFacts,
+    /// Only raw complete directory rows can mint this proof. Old caches remain unknown.
+    #[serde(default)]
+    pub pricing_verified: bool,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -41,10 +46,10 @@ pub(crate) enum RefreshError {
 
 #[derive(Serialize)]
 pub(crate) struct View {
-    fetched_at: Option<u64>,
-    stale: bool,
-    issue: Option<Issue>,
-    models: Vec<Model>,
+    pub fetched_at: Option<u64>,
+    pub stale: bool,
+    pub issue: Option<Issue>,
+    pub models: Vec<Model>,
 }
 
 #[derive(Default)]
@@ -66,6 +71,10 @@ impl OpenRouterCatalog {
             refresh: tokio::sync::Mutex::new(()),
             cache: RwLock::default(),
         }
+    }
+
+    pub(crate) fn price_source(&self) -> &str {
+        &self.endpoint
     }
 
     pub(crate) fn view(&self, now: u64) -> View {
@@ -106,7 +115,10 @@ impl OpenRouterCatalog {
         }
         let bytes = crate::stream::read_limited(response, DIRECTORY_LIMIT)
             .await
-            .map_err(|_| Issue::InvalidDirectory)?;
+            .map_err(|reason| match reason {
+                "stream-error" => Issue::Network,
+                _ => Issue::InvalidDirectory,
+            })?;
         let payload: Value = serde_json::from_slice(&bytes).map_err(|_| Issue::InvalidDirectory)?;
         let entries = payload["data"].as_array().ok_or(Issue::InvalidDirectory)?;
         if !entries.iter().any(|item| {
@@ -169,8 +181,19 @@ fn parse_model(id: &str, item: &Value) -> Option<Model> {
     }
     Some(Model {
         id: id.into(),
+        pricing_verified: true,
         tools: declares(&item["supported_parameters"], "tools"),
         context: item["context_length"].as_u64().filter(|count| *count > 0),
+        facts: {
+            let mut facts = crate::state::directory::parse_facts(
+                item,
+                manifest::schema::ProviderKind::FreeTier,
+                manifest::schema::WireProtocol::Chat,
+                crate::upstream::unix_now(),
+            );
+            facts.free_evidence = manifest::model::FreeEvidence::VendorZeroPrice;
+            facts
+        },
     })
 }
 
@@ -210,4 +233,63 @@ fn zero_price(value: &Value) -> bool {
             |(whole, decimal)| zeros(whole) && zeros(decimal),
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn complete_raw_price_dimensions_are_required_for_free_proof() {
+        let row = |pricing: Value| {
+            serde_json::json!({
+                "pricing":pricing,"architecture":{"input_modalities":["text"],"output_modalities":["text"]}
+            })
+        };
+        for pricing in [
+            serde_json::json!({"prompt":"0","completion":"0","request":"0","input_cache_read":"0"}),
+            serde_json::json!({"prompt":"0.000","completion":"0"}),
+        ] {
+            assert!(
+                parse_model("owner/model:free", &row(pricing))
+                    .unwrap()
+                    .pricing_verified
+            );
+        }
+        for pricing in [
+            serde_json::json!({"prompt":"0"}),
+            serde_json::json!({"prompt":"0","completion":"0","request":"0.001"}),
+            serde_json::json!({"prompt":"0","completion":"0","input_cache_read":null}),
+            serde_json::json!({"prompt":"0","completion":"0","image":"unknown"}),
+            serde_json::json!({"prompt":"-0","completion":"0"}),
+        ] {
+            assert!(parse_model("owner/model:free", &row(pricing)).is_none());
+        }
+        let old: Model = serde_json::from_value(
+            serde_json::json!({"id":"owner/model:free","tools":true,"context":null}),
+        )
+        .unwrap();
+        assert!(!old.pricing_verified);
+    }
+
+    #[tokio::test]
+    async fn truncated_directory_body_is_a_network_issue() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{\"data\":")
+                .await
+                .unwrap();
+            socket.shutdown().await.unwrap();
+        });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let result = OpenRouterCatalog::new(endpoint).fetch(&client).await;
+        server.await.unwrap();
+        assert!(matches!(result, Err(Issue::Network)));
+    }
 }

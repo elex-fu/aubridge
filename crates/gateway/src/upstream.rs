@@ -23,10 +23,13 @@ use translate::chat_input::ChatInput;
 use translate::{error_terminator, messages_request_to_chat, messages_request_to_responses};
 
 use crate::chat;
+use crate::chatgpt::LoginSnapshot;
 use crate::openrouter;
 use crate::route_plan::{self, Candidate, Credential};
 use crate::state::{ConnectionVersion, GatewayState};
 use crate::stream::{self, Frame, Reply, ReportedUsage, StartFailure};
+use credentials::quota::{observation_stamp, ObservationStamp};
+use manifest::quota::{ObservationSource, QuotaWindow};
 
 const MAX_ATTEMPTS: usize = 4;
 const FIRST_CONTENT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -42,13 +45,21 @@ const KEY_RETRY_SECS: u64 = 60;
 #[derive(Clone, Copy)]
 enum Input<'a> {
     Messages(&'a str),
+    Gemini(&'a translate::gemini_input::GeminiInput),
     Chat(&'a ChatInput),
     Responses(&'a translate::responses_input::ResponsesInput),
+    Compact(&'a crate::compaction::CompactInput),
 }
 
 impl Input<'_> {
-    fn allows(self, protocol: WireProtocol) -> bool {
+    fn allows(self, manifest: &manifest::schema::Manifest) -> bool {
+        let protocol = manifest.provider.protocol;
         match (self, protocol) {
+            (Self::Gemini(input), protocol) => input.supports_target(
+                gemini_wire(protocol),
+                crate::gemini::supports_chat_top_k(manifest),
+            ),
+            (Self::Compact(_), protocol) => protocol == WireProtocol::Responses,
             (Self::Chat(input), WireProtocol::Anthropic) => !input.native_only,
             (Self::Chat(input), WireProtocol::Responses) => input.supports_responses(),
             (Self::Responses(input), protocol) => {
@@ -65,7 +76,114 @@ pub async fn forward(
     client_headers: &HeaderMap,
     body: &str,
 ) -> Response<Body> {
-    forward_input(state, req, client_headers, Input::Messages(body)).await
+    crate::diagnostics::recorded(
+        forward_input(state, req, client_headers, Input::Messages(body)).await,
+    )
+}
+
+fn gemini_wire(protocol: WireProtocol) -> translate::media::Wire {
+    match protocol {
+        WireProtocol::Chat => translate::media::Wire::Chat,
+        WireProtocol::Responses => translate::media::Wire::Responses,
+        WireProtocol::Anthropic => translate::media::Wire::Messages,
+    }
+}
+pub(crate) async fn forward_gemini(
+    state: Arc<GatewayState>,
+    input: &translate::gemini_input::GeminiInput,
+    headers: &HeaderMap,
+) -> Response<Body> {
+    crate::diagnostics::recorded(
+        forward_input(state, &input.request, headers, Input::Gemini(input)).await,
+    )
+}
+pub(crate) fn count_gemini(
+    state: &GatewayState,
+    input: &translate::gemini_input::GeminiInput,
+    headers: &HeaderMap,
+) -> Response<Body> {
+    let req = &input.request;
+    let valid =
+        translate::media::check(req, translate::media::Wire::Messages, true).and_then(|_| {
+            translate::media::validate_urls(req, |url| {
+                reqwest::Url::parse(url).is_ok_and(|u| {
+                    matches!(u.scheme(), "http" | "https")
+                        && u.host_str().is_some()
+                        && u.username().is_empty()
+                        && u.password().is_none()
+                })
+            })
+        });
+    if let Err(reason) = valid {
+        return crate::gemini::error_response(StatusCode::BAD_REQUEST, reason);
+    }
+    let plan = route_plan::plan(
+        state,
+        req,
+        headers,
+        unix_now(),
+        false,
+        false,
+        |manifest, _| {
+            let wire = gemini_wire(manifest.provider.protocol);
+            if !input.supports_target(wire, crate::gemini::supports_chat_top_k(manifest)) {
+                return Some(route_plan::Block::new("native-protocol-required", None));
+            }
+            if crate::claude_cli::owns(manifest) {
+                return Some(route_plan::Block::new("native-protocol-required", None));
+            }
+            translate::media::check(req, wire, false)
+                .err()
+                .map(|reason| route_plan::Block::new(reason, None))
+        },
+    );
+    let Some(candidate) = plan.ordered.first() else {
+        return crate::gemini::error_response(
+            StatusCode::BAD_REQUEST,
+            "No compatible model for token estimate",
+        );
+    };
+    let mut req = req.clone();
+    req.model.clone_from(&candidate.model);
+    let wire = gemini_wire(candidate.manifest.provider.protocol);
+    let value = match wire {
+        translate::media::Wire::Chat => serde_json::to_value(messages_request_to_chat(&req)),
+        translate::media::Wire::Responses => {
+            serde_json::to_value(messages_request_to_responses(&req))
+        }
+        translate::media::Wire::Messages => serde_json::to_value(&req),
+    };
+    let value = value
+        .ok()
+        .and_then(|body| translate::media::encode(&req, wire, body).ok())
+        .and_then(|body| {
+            input
+                .apply_target_options(
+                    wire,
+                    body,
+                    crate::gemini::supports_chat_top_k(&candidate.manifest),
+                )
+                .ok()
+        })
+        .map(|mut body| {
+            if wire == translate::media::Wire::Messages && req.max_tokens == 0 {
+                let output = candidate
+                    .manifest
+                    .model_facts
+                    .get(&candidate.model)
+                    .and_then(|facts| facts.output)
+                    .unwrap_or(4096)
+                    .min(4096);
+                body["max_tokens"] = serde_json::json!(output);
+            }
+            if wire == translate::media::Wire::Responses && req.max_tokens > 0 {
+                body["max_output_tokens"] = serde_json::json!(req.max_tokens);
+            }
+            body["stream"] = Value::Bool(true);
+            body
+        });
+    match value {Some(value)=>axum::Json(serde_json::json!({"totalTokens":translate::count::estimate_serialized(&value),"estimated":true})).into_response(),
+        None=>crate::gemini::error_response(StatusCode::BAD_REQUEST,"Cannot estimate this request without losing content")}
 }
 
 pub(crate) async fn forward_chat(
@@ -73,7 +191,9 @@ pub(crate) async fn forward_chat(
     input: &ChatInput,
     client_headers: &HeaderMap,
 ) -> Response<Body> {
-    forward_input(state, &input.request, client_headers, Input::Chat(input)).await
+    crate::diagnostics::recorded(
+        forward_input(state, &input.request, client_headers, Input::Chat(input)).await,
+    )
 }
 
 pub(crate) async fn forward_responses(
@@ -81,13 +201,25 @@ pub(crate) async fn forward_responses(
     input: &translate::responses_input::ResponsesInput,
     client_headers: &HeaderMap,
 ) -> Response<Body> {
-    forward_input(
-        state,
-        &input.request,
-        client_headers,
-        Input::Responses(input),
+    crate::diagnostics::recorded(
+        forward_input(
+            state,
+            &input.request,
+            client_headers,
+            Input::Responses(input),
+        )
+        .await,
     )
-    .await
+}
+
+pub(crate) async fn forward_compact(
+    state: Arc<GatewayState>,
+    input: &crate::compaction::CompactInput,
+    headers: &HeaderMap,
+) -> Response<Body> {
+    crate::diagnostics::recorded(
+        forward_input(state, &input.input.request, headers, Input::Compact(input)).await,
+    )
 }
 
 async fn forward_input(
@@ -96,16 +228,101 @@ async fn forward_input(
     client_headers: &HeaderMap,
     input: Input<'_>,
 ) -> Response<Body> {
+    let valid_url = |url: &str| {
+        reqwest::Url::parse(url).is_ok_and(|url| {
+            matches!(url.scheme(), "http" | "https")
+                && url.host_str().is_some()
+                && url.username().is_empty()
+                && url.password().is_none()
+        })
+    };
+    let raw_urls = match input {
+        Input::Chat(chat) => translate::media::validate_raw_urls(
+            chat.original(),
+            translate::media::Wire::Chat,
+            valid_url,
+        ),
+        Input::Responses(responses) => translate::media::validate_raw_urls(
+            responses.original(),
+            translate::media::Wire::Responses,
+            valid_url,
+        ),
+        Input::Compact(compact) => translate::media::validate_raw_urls(
+            &compact.raw,
+            translate::media::Wire::Responses,
+            valid_url,
+        ),
+        _ => Ok(()),
+    };
+    if let Err(reason) = raw_urls {
+        return ClientError::Attachment(reason).response(input);
+    }
+    if let Err(reason) = translate::media::validate_urls(req, valid_url) {
+        return ClientError::Attachment(reason).response(input);
+    }
+    if let Err(reason) = translate::media::check(req, translate::media::Wire::Messages, true) {
+        return ClientError::Attachment(reason).response(input);
+    }
     let now = unix_now();
     let started = Instant::now();
     let response_deadline = started + RESPONSE_BUDGET;
     let streaming = req.stream != Some(false);
+    let claude_continuation = crate::claude_cli::continuation(req);
     let mut log = RequestLog::new(state.clone(), req, client_headers, now, started);
-    if router::guard::tool_loop_detected(req) {
+    let raw = match input {
+        Input::Responses(r) => Some(r.original()),
+        Input::Compact(c) => Some(&c.raw),
+        _ => None,
+    };
+    let compact = matches!(input, Input::Compact(_)) || raw.is_some_and(crate::compaction::trigger);
+    if compact {
+        log.decision.purpose = Some("compact".into());
+    }
+    let history_owner = match raw.map(|raw| state.history_owner(raw)).transpose() {
+        Ok(owner) => owner.flatten(),
+        Err(message) => {
+            log.finish("checkpoint-rejected");
+            return crate::compaction::error(StatusCode::CONFLICT, message);
+        }
+    };
+    if claude_continuation
+        && (!state.claude_cli.ready() || crate::claude_cli::mixed_continuation(req))
+    {
+        log.finish("claude-continuation-invalid");
+        return ClientError::InvalidRequest.response(input);
+    }
+    if !compact && router::guard::tool_loop_detected(req) {
         log.finish("guard");
         return loop_guard_answer(&req.model, streaming, input);
     }
 
+    let request_media = translate::media::has_media(req)
+        || match input {
+            Input::Chat(chat) => {
+                translate::media::raw_has_images(chat.original(), translate::media::Wire::Chat)
+                    || translate::media::raw_has_documents(
+                        chat.original(),
+                        translate::media::Wire::Chat,
+                    )
+            }
+            Input::Responses(responses) => {
+                translate::media::raw_has_images(
+                    responses.original(),
+                    translate::media::Wire::Responses,
+                ) || translate::media::raw_has_documents(
+                    responses.original(),
+                    translate::media::Wire::Responses,
+                )
+            }
+            Input::Compact(compact) => {
+                translate::media::raw_has_images(&compact.raw, translate::media::Wire::Responses)
+                    || translate::media::raw_has_documents(
+                        &compact.raw,
+                        translate::media::Wire::Responses,
+                    )
+            }
+            _ => false,
+        };
     let needs_tools = matches!(input, Input::Responses(responses) if responses.has_tools);
     let hosted_request =
         matches!(input, Input::Chat(chat) if !openrouter::supports(chat.original()));
@@ -117,7 +334,80 @@ async fn forward_input(
         true,
         needs_tools,
         |manifest, model| {
-            if !input.allows(manifest.provider.protocol) {
+            if crate::claude_cli::owns(manifest)
+                && matches!(input,Input::Gemini(gemini) if gemini.original().get("generationConfig").and_then(Value::as_object).is_some_and(|options|options.keys().any(|key| !matches!(key.as_str(),"maxOutputTokens"|"candidateCount"|"responseMimeType"))))
+            {
+                return Some(route_plan::Block::new("native-protocol-required", None));
+            }
+            if request_media && crate::claude_cli::owns(manifest) {
+                return Some(route_plan::Block::new(translate::media::UNSUPPORTED, None));
+            }
+            let raw_document = match input {
+                Input::Chat(chat) => translate::media::raw_has_documents(
+                    chat.original(),
+                    translate::media::Wire::Chat,
+                ),
+                Input::Responses(responses) => translate::media::raw_has_documents(
+                    responses.original(),
+                    translate::media::Wire::Responses,
+                ),
+                Input::Compact(compact) => translate::media::raw_has_documents(
+                    &compact.raw,
+                    translate::media::Wire::Responses,
+                ),
+                _ => false,
+            };
+            if raw_document && state.is_chatgpt(manifest) {
+                return Some(route_plan::Block::new(translate::media::UNSUPPORTED, None));
+            }
+            let raw_image = match input {
+                Input::Chat(chat) => {
+                    translate::media::raw_has_images(chat.original(), translate::media::Wire::Chat)
+                }
+                Input::Responses(responses) => translate::media::raw_has_images(
+                    responses.original(),
+                    translate::media::Wire::Responses,
+                ),
+                Input::Compact(compact) => translate::media::raw_has_images(
+                    &compact.raw,
+                    translate::media::Wire::Responses,
+                ),
+                _ => false,
+            };
+            if raw_image
+                && manifest
+                    .model_facts
+                    .get(model)
+                    .is_some_and(|f| f.image_input == Some(false))
+            {
+                return Some(route_plan::Block::new(
+                    translate::media::IMAGE_UNSUPPORTED,
+                    None,
+                ));
+            }
+            let wire = match manifest.provider.protocol {
+                WireProtocol::Anthropic => translate::media::Wire::Messages,
+                WireProtocol::Chat => translate::media::Wire::Chat,
+                WireProtocol::Responses => translate::media::Wire::Responses,
+            };
+            let native = matches!(
+                (manifest.provider.protocol, input),
+                (WireProtocol::Chat, Input::Chat(_))
+                    | (
+                        WireProtocol::Responses,
+                        Input::Responses(_) | Input::Compact(_)
+                    )
+                    | (WireProtocol::Anthropic, Input::Messages(_))
+            );
+            if let Err(reason) = translate::media::check(req, wire, native) {
+                return Some(route_plan::Block::new(reason, None));
+            }
+            if claude_continuation && !crate::claude_cli::owns(manifest) {
+                return Some(route_plan::Block::new("claude-continuation-source", None));
+            }
+            if (compact && manifest.provider.protocol != WireProtocol::Responses)
+                || !input.allows(manifest)
+            {
                 return Some(route_plan::Block::new("native-protocol-required", None));
             }
             (openrouter::applies(manifest) && (hosted_request || !crate::catalog::free_id(model)))
@@ -128,6 +418,43 @@ async fn forward_input(
         let error = ClientError::ModelNotFound;
         log.finish(error.code());
         return error.response(input);
+    }
+    if plan.ordered.is_empty() {
+        if matches!(input, Input::Gemini(_)) && plan.has_block("native-protocol-required") {
+            log.skipped = std::mem::take(&mut plan.skipped);
+            log.finish("native-protocol-required");
+            return crate::gemini::error_response(
+                StatusCode::BAD_REQUEST,
+                "The configured upstreams cannot represent these Gemini generation options",
+            );
+        }
+        if request_media
+            && (plan.has_block("native-protocol-required") || plan.has_block("tools-unsupported"))
+        {
+            log.skipped = std::mem::take(&mut plan.skipped);
+            log.finish(translate::media::UNSUPPORTED);
+            return ClientError::Attachment(translate::media::UNSUPPORTED).response(input);
+        }
+        let error = [
+            ("model-not-listed", ClientError::ModelNotListed),
+            ("output-limit-exceeded", ClientError::OutputLimit),
+            ("reasoning-unsupported", ClientError::ReasoningUnsupported),
+            (
+                translate::media::UNSUPPORTED,
+                ClientError::Attachment(translate::media::UNSUPPORTED),
+            ),
+            (
+                translate::media::IMAGE_UNSUPPORTED,
+                ClientError::Attachment(translate::media::IMAGE_UNSUPPORTED),
+            ),
+        ]
+        .into_iter()
+        .find(|(reason, _)| plan.has_block(reason));
+        if let Some((reason, error)) = error {
+            log.skipped = std::mem::take(&mut plan.skipped);
+            log.finish(reason);
+            return error.response(input);
+        }
     }
     let rejected_by_free_policy = plan.ordered.is_empty() && plan.has_block(openrouter::RESTRICTED);
     let deferred_context = plan.prefer_context(req);
@@ -181,7 +508,9 @@ async fn forward_input(
             log.skip(candidate, route_plan::Block::new("response-budget", None));
             continue;
         };
-        let permit = if let Some(slot) = state.subscription_slot(id, candidate.manifest.kind) {
+        let permit = if crate::claude_cli::owns(&candidate.manifest) {
+            None
+        } else if let Some(slot) = state.subscription_slot(id, candidate.manifest.kind) {
             let permit = if revisit {
                 log.skip(candidate, route_plan::Block::new(PROVIDER_BUSY, None));
                 let permit = tokio::time::timeout_at(deadline, slot.acquire_owned())
@@ -235,10 +564,36 @@ async fn forward_input(
                 req,
                 client_headers,
                 input,
+                DispatchIntent::Inference {
+                    pin_login: compact || history_owner.is_some(),
+                },
                 |connection| {
                     if Instant::now() >= deadline {
                         return Err("first-content-timeout");
                     }
+                    let subject = connection
+                        .login
+                        .as_ref()
+                        .map(LoginSnapshot::compaction_subject)
+                        .unwrap_or_else(|| connection.quota_subject.clone());
+                    let owner = crate::compaction::owner(candidate, &subject);
+                    if history_owner
+                        .as_ref()
+                        .is_some_and(|expected| expected != &owner)
+                    {
+                        return Err("checkpoint-owner-changed");
+                    }
+                    let operation = if matches!(input, Input::Compact(_)) {
+                        "unary"
+                    } else {
+                        "v2"
+                    };
+                    let key = format!("{owner}:{}:{operation}", candidate.model);
+                    if compact && !state.compact_ready(&key, unix_now()) {
+                        return Err("compaction-backoff");
+                    }
+                    log.compaction_owner = Some(owner);
+                    log.compaction_key = compact.then_some(key);
                     log.start(candidate, connection);
                     Ok(())
                 },
@@ -247,10 +602,26 @@ async fn forward_input(
         .await
         .unwrap_or(Err("first-content-timeout"));
         attempts += usize::from(log.active.is_some());
-        let response = match response {
+        let mut response = match response {
             Ok(sent) => sent,
             Err(reason) if log.active.is_none() => {
                 log.skip(candidate, route_plan::Block::new(reason, None));
+                continue;
+            }
+            Err(reason)
+                if reason.starts_with("claude-continuation-")
+                    || reason == "claude-login-changed" =>
+            {
+                log.end_attempt(reason, false);
+                log.finish(reason);
+                return ClientError::InvalidRequest.response(input);
+            }
+            Err("provider-busy") => {
+                log.end_attempt("provider-busy", false);
+                continue;
+            }
+            Err(reason) if compact => {
+                log.end_attempt(reason, false);
                 continue;
             }
             Err(reason) => {
@@ -259,8 +630,77 @@ async fn forward_input(
                 continue;
             }
         };
+        if let Some(login) = response.extensions_mut().remove::<LoginSnapshot>() {
+            log.compaction_owner = Some(crate::compaction::owner(
+                candidate,
+                &login.compaction_subject(),
+            ));
+            if let Some(connection) = &mut log.active_mut().connection {
+                connection.quota_subject = login.quota_subject();
+                connection.login = Some(login);
+            }
+        }
         let status = response.status();
         log.active_mut().status = status.as_u16();
+        if let Some(connection) = &mut log.active_mut().connection {
+            connection.stamp = observation_stamp();
+        }
+        if compact && status != StatusCode::OK {
+            log.active_mut().headers = Some(response.headers().clone());
+            if matches!(status.as_u16(), 400 | 404 | 405 | 422) {
+                log.end_attempt("compaction-unsupported", false);
+            } else {
+                let headers = response.headers().clone();
+                let body = tokio::time::timeout_at(
+                    deadline,
+                    stream::read_limited(response, UPSTREAM_ERROR_LIMIT),
+                )
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or_default();
+                if let Some(error) = log.reject(
+                    candidate,
+                    req,
+                    status.as_u16(),
+                    &headers,
+                    FailureBody::Http(&String::from_utf8_lossy(&body)),
+                ) {
+                    return error.response(input);
+                }
+            }
+            continue;
+        }
+        if compact {
+            log.active_mut().headers = Some(response.headers().clone());
+            let result = tokio::time::timeout_at(
+                response_deadline,
+                native_compaction(response, input, &mut log),
+            )
+            .await;
+            match result {
+                Ok(Ok((bytes, stream))) => {
+                    log.content_ready();
+                    log.finish("ok");
+                    return Response::builder()
+                        .header(
+                            "content-type",
+                            if stream {
+                                "text/event-stream"
+                            } else {
+                                "application/json"
+                            },
+                        )
+                        .header("x-aubridge-provider", id)
+                        .body(Body::from(bytes))
+                        .expect("compact response");
+                }
+                _ => {
+                    log.end_attempt("compaction-invalid-response", false);
+                    continue;
+                }
+            }
+        }
         if status != StatusCode::OK {
             let headers = response.headers().clone();
             let body = tokio::time::timeout_at(
@@ -349,8 +789,21 @@ async fn forward_input(
                         &candidate.model,
                         now,
                     ),
-                    Input::Messages(_) | Input::Responses(_) => message,
+                    Input::Gemini(_) => match crate::gemini::completion(
+                        &message,
+                        &log.active_mut().usage,
+                        protocol,
+                        &candidate.model,
+                    ) {
+                        Ok(message) => message,
+                        Err(reason) => {
+                            log.finish("stream-error");
+                            return crate::gemini::error_response(StatusCode::BAD_GATEWAY, reason);
+                        }
+                    },
+                    Input::Messages(_) | Input::Responses(_) | Input::Compact(_) => message,
                 };
+                reply.cli_delivered();
                 log.content_ready();
                 log.finish("ok");
                 return json_response(message, id);
@@ -362,6 +815,23 @@ async fn forward_input(
         }
     }
 
+    if history_owner.is_some() {
+        log.finish("checkpoint-owner-unavailable");
+        return crate::compaction::error(StatusCode::CONFLICT, "Checkpoint owner is unavailable or the selected account changed; restore the original source and login");
+    }
+    if compact
+        && log.skipped.iter().any(|entry| {
+            plan.ordered
+                .iter()
+                .any(|candidate| entry.matches(candidate, "compaction-backoff"))
+        })
+    {
+        log.finish("compaction-backoff");
+        return crate::compaction::error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Compaction is backing off after an upstream failure; retry later",
+        );
+    }
     if log.context_failure.is_some() {
         let error = ClientError::ContextLength;
         log.finish(error.code());
@@ -380,7 +850,16 @@ async fn forward_input(
         return ClientError::FreeRouteRestricted.response(input);
     }
     log.finish("no-candidate");
-    if matches!(input, Input::Chat(_) | Input::Responses(_)) {
+    if matches!(input, Input::Gemini(_)) {
+        return crate::gemini::error_response(
+            StatusCode::BAD_GATEWAY,
+            "No compatible upstream succeeded",
+        );
+    }
+    if matches!(
+        input,
+        Input::Chat(_) | Input::Responses(_) | Input::Compact(_)
+    ) {
         return chat::error_response(
             StatusCode::BAD_GATEWAY,
             "No compatible upstream succeeded",
@@ -421,11 +900,46 @@ pub(crate) async fn count_tokens(
     headers: &HeaderMap,
     body: &str,
 ) -> Response<Body> {
-    let plan = route_plan::plan(state, req, headers, unix_now(), false, false, |_, _| None);
+    let validation =
+        translate::media::check(req, translate::media::Wire::Messages, true).and_then(|_| {
+            translate::media::validate_urls(req, |url| {
+                reqwest::Url::parse(url).is_ok_and(|url| {
+                    matches!(url.scheme(), "http" | "https")
+                        && url.host_str().is_some()
+                        && url.username().is_empty()
+                        && url.password().is_none()
+                })
+            })
+        });
+    if let Err(reason) = validation {
+        return ClientError::Attachment(reason).response(Input::Messages(body));
+    }
+    let plan = route_plan::plan(
+        state,
+        req,
+        headers,
+        unix_now(),
+        false,
+        false,
+        |manifest, _| {
+            if translate::media::has_media(req) && crate::claude_cli::owns(manifest) {
+                return Some(route_plan::Block::new(translate::media::UNSUPPORTED, None));
+            }
+            let wire = match manifest.provider.protocol {
+                WireProtocol::Anthropic => translate::media::Wire::Messages,
+                WireProtocol::Chat => translate::media::Wire::Chat,
+                WireProtocol::Responses => translate::media::Wire::Responses,
+            };
+            translate::media::check(req, wire, wire == translate::media::Wire::Messages)
+                .err()
+                .map(|reason| route_plan::Block::new(reason, None))
+        },
+    );
     let candidate = plan.ordered.first();
-    if let Some(candidate) =
-        candidate.filter(|c| c.manifest.provider.protocol == WireProtocol::Anthropic)
-    {
+    if let Some(candidate) = candidate.filter(|c| {
+        c.manifest.provider.protocol == WireProtocol::Anthropic
+            && !crate::claude_cli::owns(&c.manifest)
+    }) {
         if let Some(count) = native_count(state, candidate, headers, body).await {
             return axum::Json(count).into_response();
         }
@@ -439,14 +953,41 @@ pub(crate) async fn count_tokens(
             strip_messages_attribution(&mut input);
         }
     }
-    let estimated = match candidate.map(|c| c.manifest.provider.protocol) {
-        Some(WireProtocol::Chat) => {
-            translate::count::estimate_serialized(&messages_request_to_chat(&input))
+    let protocol = candidate.map(|c| c.manifest.provider.protocol);
+    let media_body = if translate::media::has_media(&input) {
+        match protocol {
+            Some(WireProtocol::Chat) => serde_json::to_value(messages_request_to_chat(&input))
+                .ok()
+                .and_then(|body| {
+                    translate::media::encode(&input, translate::media::Wire::Chat, body).ok()
+                }),
+            Some(WireProtocol::Responses) => {
+                serde_json::to_value(messages_request_to_responses(&input))
+                    .ok()
+                    .and_then(|body| {
+                        translate::media::encode(&input, translate::media::Wire::Responses, body)
+                            .ok()
+                    })
+            }
+            _ => None,
         }
-        Some(WireProtocol::Responses) => {
-            translate::count::estimate_serialized(&messages_request_to_responses(&input))
+    } else {
+        None
+    };
+    let estimated = if let Some(body) = media_body {
+        translate::count::estimate_serialized(&body)
+    } else if translate::media::has_media(&input) {
+        translate::count::estimate_tokens(&input)
+    } else {
+        match protocol {
+            Some(WireProtocol::Chat) => {
+                translate::count::estimate_serialized(&messages_request_to_chat(&input))
+            }
+            Some(WireProtocol::Responses) => {
+                translate::count::estimate_serialized(&messages_request_to_responses(&input))
+            }
+            _ => translate::count::estimate_tokens(&input),
         }
-        _ => translate::count::estimate_tokens(&input),
     };
     axum::Json(serde_json::json!({"input_tokens": estimated, "estimated": true})).into_response()
 }
@@ -475,7 +1016,9 @@ pub(crate) async fn check_provider(
     let Some(model) = model.filter(|model| manifest.free_models.contains(model)) else {
         return Some(result);
     };
-    let _permit = if let Some(slot) = state.subscription_slot(id, manifest.kind) {
+    let _permit = if crate::claude_cli::owns(&manifest) {
+        None
+    } else if let Some(slot) = state.subscription_slot(id, manifest.kind) {
         let Ok(permit) = slot.try_acquire_owned() else {
             result.status = "provider-busy";
             return Some(result);
@@ -506,6 +1049,7 @@ pub(crate) async fn check_provider(
     };
     let deadline = Instant::now() + CHECK_TIMEOUT;
     let body = serde_json::to_string(&request).ok()?;
+    let mut checked_connection = None;
     let response = tokio::time::timeout_at(
         deadline,
         send(
@@ -514,7 +1058,11 @@ pub(crate) async fn check_provider(
             &request,
             &HeaderMap::new(),
             Input::Messages(&body),
-            |_| Ok(()),
+            DispatchIntent::SourceCheck,
+            |connection| {
+                checked_connection = Some(connection);
+                Ok(())
+            },
         ),
     )
     .await
@@ -577,6 +1125,24 @@ pub(crate) async fn check_provider(
             }
         }
     };
+    if let Some(connection) = checked_connection {
+        state.update_bound_connection(
+            id,
+            Some(&connection.version),
+            connection.login.as_ref(),
+            connection.cli_epoch.as_ref(),
+            || {
+                state.record_source_check(
+                    id,
+                    &connection.version,
+                    &connection.quota_subject,
+                    result.status,
+                    &candidate.model,
+                    unix_now(),
+                );
+            },
+        );
+    }
     Some(result)
 }
 
@@ -602,6 +1168,9 @@ async fn native_count(
     {
         return None;
     }
+    state
+        .cost_block(&candidate.manifest, &candidate.model, unix_now())
+        .map_or(Some(()), |_| None)?;
     let (credential, _) = state.dispatch_credential(&candidate.manifest).ok()?;
     let response = build_post(
         state,
@@ -621,14 +1190,21 @@ async fn native_count(
     count["input_tokens"].as_u64().map(|_| count)
 }
 
+enum DispatchIntent {
+    Inference { pin_login: bool },
+    SourceCheck,
+}
+
 async fn send(
     state: &GatewayState,
     candidate: &Candidate,
     req: &MessagesRequest,
     headers: &HeaderMap,
     input: Input<'_>,
+    intent: DispatchIntent,
     on_dispatch: impl FnOnce(DispatchedConnection) -> Result<(), &'static str>,
 ) -> Result<reqwest::Response, &'static str> {
+    let cli_generation = state.claude_cli.generation();
     let mut request = if req.model == candidate.model {
         Cow::Borrowed(req)
     } else {
@@ -642,6 +1218,47 @@ async fn send(
         strip_messages_attribution(&mut request);
     }
     let (path, body) = match (candidate.manifest.provider.protocol, input) {
+        (WireProtocol::Responses, Input::Compact(compact)) => (
+            "/responses/compact",
+            serde_json::to_string(&compact.native(&candidate.model)),
+        ),
+        (_, Input::Compact(_)) => return Err("native-protocol-required"),
+        (protocol, Input::Gemini(input)) => {
+            let wire = gemini_wire(protocol);
+            let value = match protocol {
+                WireProtocol::Chat => serde_json::to_value(messages_request_to_chat(&request)),
+                WireProtocol::Responses => {
+                    serde_json::to_value(messages_request_to_responses(&request))
+                }
+                WireProtocol::Anthropic => serde_json::to_value(request.as_ref()),
+            }
+            .map_err(|_| "encode-error")?;
+            let mut value = input.apply_target_options(
+                wire,
+                value,
+                crate::gemini::supports_chat_top_k(&candidate.manifest),
+            )?;
+            if protocol == WireProtocol::Responses && request.max_tokens > 0 {
+                value["max_output_tokens"] = serde_json::json!(request.max_tokens);
+            }
+            if protocol == WireProtocol::Anthropic && request.max_tokens == 0 {
+                let output = candidate
+                    .manifest
+                    .model_facts
+                    .get(&candidate.model)
+                    .and_then(|facts| facts.output)
+                    .unwrap_or(4096)
+                    .min(4096);
+                value["max_tokens"] = serde_json::json!(output);
+            }
+            value["stream"] = Value::Bool(true);
+            let path = match protocol {
+                WireProtocol::Chat => "/chat/completions",
+                WireProtocol::Responses => "/responses",
+                WireProtocol::Anthropic => "/messages",
+            };
+            (path, serde_json::to_string(&value))
+        }
         (WireProtocol::Chat, Input::Chat(chat)) => (
             "/chat/completions",
             serde_json::to_string(&chat.for_chat(&candidate.model)),
@@ -704,27 +1321,94 @@ async fn send(
         ),
     };
     let body = body.map_err(|_| "encode-error")?;
+    let native = matches!(
+        (candidate.manifest.provider.protocol, input),
+        (WireProtocol::Chat, Input::Chat(_))
+            | (WireProtocol::Responses, Input::Responses(_))
+            | (WireProtocol::Anthropic, Input::Messages(_))
+    );
+    let body = if !native && translate::media::has_media(&request) {
+        let wire = match candidate.manifest.provider.protocol {
+            WireProtocol::Chat => translate::media::Wire::Chat,
+            WireProtocol::Responses => translate::media::Wire::Responses,
+            WireProtocol::Anthropic => translate::media::Wire::Messages,
+        };
+        let value = serde_json::from_str(&body).map_err(|_| "encode-error")?;
+        let value = translate::media::encode(&request, wire, value)?;
+        serde_json::to_string(&value).map_err(|_| "encode-error")?
+    } else {
+        body
+    };
     let body = if openrouter::applies(&candidate.manifest) {
         openrouter::protect(&body, &candidate.model)?
     } else {
         body
     };
+    if crate::claude_cli::owns(&candidate.manifest) {
+        if state.provider_paused(crate::claude_cli::ID) {
+            return Err("provider-paused");
+        }
+        state.refresh_claude_cli().await;
+    }
     let (credential, version) = state.dispatch_credential(&candidate.manifest)?;
     let chatgpt = if matches!(credential, Credential::ChatGpt) {
         Some(state.chatgpt_snapshot().await.ok_or("missing-credential")?)
     } else {
         None
     };
+    let cli_binding = if matches!(credential, Credential::ClaudeCli) {
+        Some(state.claude_cli.binding().ok_or("missing-credential")?)
+    } else {
+        None
+    };
+    // Login refresh can await: reject a changed connection and recheck the
+    // current cost facts immediately before dispatch. Explicit checks are scoped separately.
+    let (_, current_version) = state.dispatch_credential(&candidate.manifest)?;
+    if !Arc::ptr_eq(&version, &current_version) {
+        return Err(route_plan::PROVIDER_CHANGED);
+    }
+    if matches!(intent, DispatchIntent::Inference { .. }) {
+        if let Some(reason) = state.cost_block(&candidate.manifest, &candidate.model, unix_now()) {
+            return Err(reason);
+        }
+    }
     on_dispatch(DispatchedConnection {
         version,
         uses_key: matches!(credential, Credential::Key(_)),
+        quota_subject: match &credential {
+            Credential::Key(key) => crate::state::quota::api_subject(&candidate.manifest, key),
+            Credential::ChatGpt => chatgpt
+                .as_ref()
+                .map(LoginSnapshot::quota_subject)
+                .unwrap_or_default(),
+            Credential::ClaudeCli => cli_binding
+                .as_ref()
+                .map(|(subject, _)| subject.clone())
+                .unwrap_or_default(),
+            Credential::Local => crate::state::quota::local_subject(&candidate.manifest),
+        },
+        cli_epoch: cli_binding.map(|(_, epoch)| epoch),
+        login: chatgpt.clone(),
+        stamp: observation_stamp(),
     })?;
+    if matches!(credential, Credential::ClaudeCli) {
+        let slot = state
+            .subscription_slot(&candidate.manifest.id, candidate.manifest.kind)
+            .ok_or("provider-busy")?;
+        return state
+            .claude_cli
+            .send(&request, headers, slot, cli_generation, || {
+                state.is_serving() && !state.provider_paused(&candidate.manifest.id)
+            })
+            .await;
+    }
     if let Some(tokens) = chatgpt {
         send_chatgpt(
             state,
-            &format!("{}{path}", candidate.manifest.provider.base),
+            &upstream_url(&candidate.manifest.provider.base, path),
             body,
             tokens,
+            matches!(intent, DispatchIntent::Inference { pin_login: true }),
         )
         .await
     } else {
@@ -734,6 +1418,80 @@ async fn send(
             .await
             .map_err(|_| "network-error")
     }
+}
+
+async fn native_compaction(
+    response: reqwest::Response,
+    input: Input<'_>,
+    log: &mut RequestLog,
+) -> Result<(Vec<u8>, bool), &'static str> {
+    let owner = log.compaction_owner.clone().ok_or("missing-owner")?;
+    if matches!(input, Input::Compact(_)) {
+        let bytes = stream::read_limited(response, 16 * 1024 * 1024)
+            .await
+            .map_err(|_| "invalid-json")?;
+        let value: Value = serde_json::from_slice(&bytes).map_err(|_| "invalid-json")?;
+        if !value["error"].is_null() {
+            return Err("upstream-compact-error");
+        }
+        let items = value["output"].as_array().ok_or("missing-output")?;
+        let checkpoints: Vec<_> = items
+            .iter()
+            .filter(|item| crate::compaction::is_checkpoint(item))
+            .collect();
+        if checkpoints.len() != 1 {
+            return Err("invalid-checkpoint-count");
+        }
+        log.active_mut().usage.observe(
+            manifest::schema::WireProtocol::Responses,
+            &serde_json::json!({"response":&value}),
+        );
+        log.state
+            .save_checkpoint(checkpoints[0], &owner, unix_now())?;
+        return Ok((bytes.to_vec(), false));
+    }
+    let mut reply = Reply::new(response, WireProtocol::Responses, "", None).for_responses();
+    let mut output = Vec::new();
+    let mut checkpoint = None;
+    let mut completed = false;
+    let mut terminal_checkpoints = Vec::new();
+    while let Some(frame) = reply.next(&mut log.active_mut().usage).await {
+        if output.len() + frame.bytes.len() > 16 * 1024 * 1024 {
+            return Err("response-too-large");
+        }
+        if frame.event["type"] == "response.output_item.done"
+            && crate::compaction::is_v2_checkpoint(&frame.event["item"])
+        {
+            if checkpoint.is_some() {
+                return Err("multiple-checkpoints");
+            }
+            checkpoint = Some(frame.event["item"].clone());
+        }
+        if frame.event["type"] == "response.completed" {
+            completed = true;
+            if let Some(items) = frame.event["response"]["output"].as_array() {
+                terminal_checkpoints.extend(
+                    items
+                        .iter()
+                        .filter(|item| crate::compaction::is_checkpoint(item))
+                        .cloned(),
+                );
+            }
+        }
+        output.extend_from_slice(&frame.bytes);
+    }
+    if reply.failed || !completed {
+        return Err("incomplete-compaction");
+    }
+    let checkpoint = checkpoint.ok_or("missing-checkpoint")?;
+    if terminal_checkpoints
+        .iter()
+        .any(|item| item["encrypted_content"] != checkpoint["encrypted_content"])
+    {
+        return Err("conflicting-terminal-checkpoint");
+    }
+    log.state.save_checkpoint(&checkpoint, &owner, unix_now())?;
+    Ok((output, true))
 }
 
 // Keep Anthropic's per-request attribution out of the translated prefix.
@@ -791,6 +1549,15 @@ fn attribution_remainder(text: &str) -> Option<&str> {
     has_version.then_some(tail)
 }
 
+fn upstream_url(base: &str, path: &str) -> String {
+    let base = base.trim_end_matches('/');
+    if path == "/responses/compact" && base.ends_with("/responses") {
+        format!("{base}/compact")
+    } else {
+        format!("{base}{path}")
+    }
+}
+
 fn build_post(
     state: &GatewayState,
     candidate: &Candidate,
@@ -798,13 +1565,13 @@ fn build_post(
     headers: &HeaderMap,
     path: &str,
 ) -> reqwest::RequestBuilder {
-    let base = candidate.manifest.provider.base.trim_end_matches('/');
     let mut request = state
         .http()
-        .post(format!("{base}{path}"))
+        .post(upstream_url(&candidate.manifest.provider.base, path))
         .header("content-type", "application/json");
     if let Credential::Key(key) = credential {
         request = match candidate.manifest.provider.auth {
+            AuthKind::ClaudeCli => request,
             AuthKind::Bearer => request.bearer_auth(key),
             AuthKind::ApiKey => request.header("x-api-key", key),
         };
@@ -827,6 +1594,7 @@ async fn send_chatgpt(
     url: &str,
     body: String,
     tokens: crate::chatgpt::LoginSnapshot,
+    pin_login: bool,
 ) -> Result<reqwest::Response, &'static str> {
     let response = crate::chatgpt::responses_builder(state.http(), url, &tokens)
         .body(body.clone())
@@ -836,17 +1604,24 @@ async fn send_chatgpt(
     if response.status() != StatusCode::UNAUTHORIZED {
         return Ok(response);
     }
+    let expected_subject = tokens.compaction_subject();
     let Some(fresh) = state.chatgpt_refresh_snapshot(tokens).await else {
         return Ok(response);
     };
-    crate::chatgpt::responses_builder(state.http(), url, &fresh)
+    if pin_login && fresh.compaction_subject() != expected_subject {
+        return Ok(response);
+    }
+    let mut response = crate::chatgpt::responses_builder(state.http(), url, &fresh)
         .body(body)
         .send()
         .await
-        .map_err(|_| "network-error")
+        .map_err(|_| "network-error")?;
+    response.extensions_mut().insert(fresh);
+    Ok(response)
 }
 
 enum Projection {
+    Gemini(translate::gemini_output::GeminiEncoder, WireProtocol),
     Chat(chat::Encoder),
     Responses(crate::responses::Encoder),
 }
@@ -854,6 +1629,10 @@ enum Projection {
 impl Projection {
     fn for_input(input: Input<'_>, model: &str, now: u64, from: WireProtocol) -> Option<Self> {
         match input {
+            Input::Gemini(_) => Some(Self::Gemini(
+                translate::gemini_output::GeminiEncoder::new(model),
+                from,
+            )),
             Input::Chat(chat) if from != WireProtocol::Chat => Some(Self::Chat(
                 chat::Encoder::new(model, now, from, chat.include_usage),
             )),
@@ -871,6 +1650,26 @@ impl Projection {
 
     fn encode(&mut self, event: &Value, usage: &ReportedUsage) -> Option<Bytes> {
         match self {
+            Self::Gemini(encoder, from) => {
+                if event.is_null() {
+                    return None;
+                }
+                if let Some(model) = usage.model.as_deref() {
+                    encoder.set_model(model);
+                }
+                encoder.set_usage(crate::gemini::usage(usage, *from));
+                let frames = encoder.push_raw(event);
+                if frames.is_empty() {
+                    None
+                } else {
+                    Some(Bytes::from(
+                        frames
+                            .iter()
+                            .map(translate::gemini_output::frame)
+                            .collect::<String>(),
+                    ))
+                }
+            }
             Self::Chat(encoder) => encoder.encode(event, usage),
             Self::Responses(encoder) => encoder.encode(event, usage),
         }
@@ -887,8 +1686,29 @@ fn streaming_response(
     let stream = futures_util::stream::unfold(
         (held, reply, log, encoder),
         |(mut held, mut reply, mut log, mut encoder)| async move {
-            let idle_deadline = Instant::now() + SSE_KEEPALIVE;
             loop {
+                if reply.ended && held.is_empty() {
+                    return None;
+                }
+                if matches!(&encoder, Some(Projection::Gemini(..)))
+                    && Instant::now() >= log.started + RESPONSE_BUDGET
+                {
+                    let error = crate::gemini::error(
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "Gateway response deadline exceeded",
+                    );
+                    reply.abort();
+                    held.clear();
+                    log.finish("stream-error");
+                    return Some((
+                        Ok(Bytes::from(translate::gemini_output::frame(&error))),
+                        (held, reply, log, encoder),
+                    ));
+                }
+                let mut idle_deadline = Instant::now() + SSE_KEEPALIVE;
+                if matches!(&encoder, Some(Projection::Gemini(..))) {
+                    idle_deadline = idle_deadline.min(log.started + RESPONSE_BUDGET);
+                }
                 let frame = match held.pop_front() {
                     Some(frame) => frame,
                     None if reply.ended => return None,
@@ -900,18 +1720,62 @@ fn streaming_response(
                     {
                         Ok(frame) => frame?,
                         Err(_) => {
+                            if matches!(&encoder, Some(Projection::Gemini(..))) {
+                                continue;
+                            }
                             let comment = Bytes::from(proto::sse::frame_keepalive());
                             return Some((Ok(comment), (held, reply, log, encoder)));
                         }
                     },
                 };
+                let mut checkpoints = Vec::new();
+                if matches!(
+                    frame.event["type"].as_str(),
+                    Some("response.output_item.added" | "response.output_item.done")
+                ) && crate::compaction::is_checkpoint(&frame.event["item"])
+                    && (frame.event["type"] == "response.output_item.done"
+                        || !frame.event["item"]["encrypted_content"].is_null())
+                {
+                    checkpoints.push(&frame.event["item"]);
+                }
+                if frame.event["type"] == "response.completed" {
+                    if let Some(items) = frame.event["response"]["output"].as_array() {
+                        checkpoints.extend(
+                            items
+                                .iter()
+                                .filter(|item| crate::compaction::is_checkpoint(item)),
+                        );
+                    }
+                }
+                for checkpoint in checkpoints {
+                    let saved = log
+                        .compaction_owner
+                        .as_deref()
+                        .ok_or("Checkpoint owner missing")
+                        .and_then(|owner| log.state.save_checkpoint(checkpoint, owner, unix_now()));
+                    if saved.is_err() {
+                        reply.ended = true;
+                        reply.failed = true;
+                        held.clear();
+                        log.finish("checkpoint-store-error");
+                        return Some((
+                            Ok(Bytes::from(crate::responses::stream_failure(
+                                "resp_failed",
+                                0,
+                                false,
+                            ))),
+                            (held, reply, log, encoder),
+                        ));
+                    }
+                }
                 let bytes = match encoder.as_mut() {
                     Some(encoder) => encoder.encode(&frame.event, &log.active_mut().usage),
                     None => Some(frame.bytes),
                 };
-                if matches!(&encoder, Some(Projection::Responses(encoder)) if encoder.failed) {
-                    reply.ended = true;
-                    reply.failed = true;
+                if matches!(&encoder, Some(Projection::Responses(encoder)) if encoder.failed)
+                    || matches!(&encoder,Some(Projection::Gemini(encoder,_)) if encoder.failed())
+                {
+                    reply.abort();
                     held.clear();
                 }
                 if reply.ended {
@@ -931,6 +1795,9 @@ fn streaming_response(
                     } else {
                         "ok"
                     };
+                    if outcome == "ok" {
+                        reply.cli_delivered();
+                    }
                     log.finish(outcome);
                 }
                 if let Some(bytes) = bytes {
@@ -968,6 +1835,10 @@ fn json_response(message: Value, provider: &str) -> Response<Body> {
 struct DispatchedConnection {
     version: ConnectionVersion,
     uses_key: bool,
+    quota_subject: String,
+    login: Option<LoginSnapshot>,
+    cli_epoch: Option<Arc<()>>,
+    stamp: ObservationStamp,
 }
 
 struct Attempt {
@@ -982,9 +1853,21 @@ struct Attempt {
     usage: ReportedUsage,
     connection: Option<DispatchedConnection>,
     stream_limit: Option<HttpFailure>,
+    price_snapshot: Option<ledger::PriceSnapshot>,
+    benchmark_snapshot: Option<ledger::PriceSnapshot>,
 }
 
 impl Attempt {
+    fn login(&self) -> Option<&LoginSnapshot> {
+        self.connection
+            .as_ref()
+            .and_then(|connection| connection.login.as_ref())
+    }
+    fn cli_epoch(&self) -> Option<&Arc<()>> {
+        self.connection
+            .as_ref()
+            .and_then(|connection| connection.cli_epoch.as_ref())
+    }
     fn connection_version(&self) -> Option<&ConnectionVersion> {
         self.connection
             .as_ref()
@@ -1008,6 +1891,8 @@ struct RequestLog {
     active: Option<Attempt>,
     context_failure: Option<ContextFailure>,
     finished: bool,
+    compaction_owner: Option<String>,
+    compaction_key: Option<String>,
 }
 
 impl RequestLog {
@@ -1022,14 +1907,30 @@ impl RequestLog {
         let agent = crate::security::caller_key(headers)
             .and_then(|key| key.strip_prefix(&prefix).map(str::to_string))
             .unwrap_or_else(|| "-".to_string());
+        let identity = crate::session_identity::extract(headers, Some(req));
         Self {
             started,
             state,
             affinity: route_plan::session_key(req, headers),
             decision: ledger::DecisionRecord {
+                session_id: identity.session,
+                parent_session_id: identity.parent,
+                purpose: identity.purpose,
                 ts: now,
                 model: req.model.clone(),
                 agent,
+                request_id: headers
+                    .get(crate::diagnostics::REQUEST_ID)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned),
+                request_path: headers
+                    .get(crate::diagnostics::REQUEST_PATH)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned),
+                request_bytes: headers
+                    .get(crate::diagnostics::REQUEST_BYTES)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse().ok()),
                 ..Default::default()
             },
             attempts: Vec::new(),
@@ -1038,6 +1939,8 @@ impl RequestLog {
             active: None,
             context_failure: None,
             finished: false,
+            compaction_owner: None,
+            compaction_key: None,
         }
     }
 
@@ -1054,6 +1957,12 @@ impl RequestLog {
             usage: ReportedUsage::default(),
             connection: Some(connection),
             stream_limit: None,
+            benchmark_snapshot: self
+                .state
+                .benchmark_snapshot(&candidate.manifest.id, &candidate.model),
+            price_snapshot: self
+                .state
+                .served_price_snapshot(&candidate.manifest, &candidate.model),
         });
     }
 
@@ -1067,10 +1976,15 @@ impl RequestLog {
 
     fn note_breaker_failure(&self) {
         let attempt = self.active.as_ref().expect("started attempt");
-        self.state
-            .update_current_connection(&attempt.id, attempt.connection_version(), || {
+        self.state.update_bound_connection(
+            &attempt.id,
+            attempt.connection_version(),
+            attempt.login(),
+            attempt.cli_epoch(),
+            || {
                 self.state.apply_breaker_failure(&attempt.id, unix_now());
-            });
+            },
+        );
     }
 
     fn reject_before_content(
@@ -1117,8 +2031,12 @@ impl RequestLog {
         }
         let id = &candidate.manifest.id;
         let attempt = self.active.as_ref().expect("started attempt");
-        self.state
-            .update_current_connection(id, attempt.connection_version(), || {
+        self.state.update_bound_connection(
+            id,
+            attempt.connection_version(),
+            attempt.login(),
+            attempt.cli_epoch(),
+            || {
                 if status == 401
                     && attempt
                         .connection
@@ -1131,7 +2049,8 @@ impl RequestLog {
                 if matches!(status, 408 | 500..=528 | 530..=599) {
                     self.state.apply_breaker_failure(id, now);
                 }
-            });
+            },
+        );
         self.end_attempt(failure.reason, false);
         None
     }
@@ -1198,6 +2117,12 @@ impl RequestLog {
     }
 
     fn end_attempt(&mut self, outcome: &str, chosen: bool) {
+        if let Some(key) = self.compaction_key.take() {
+            if outcome != "cancelled" {
+                self.state.compact_result(&key, outcome == "ok", unix_now());
+            }
+        }
+
         let Some(mut attempt) = self.active.take() else {
             return;
         };
@@ -1207,10 +2132,46 @@ impl RequestLog {
             .model
             .take()
             .unwrap_or_else(|| attempt.model.clone());
+        let cache_read = attempt
+            .usage
+            .cache_read_reported
+            .then_some(attempt.usage.cache_read);
+        let cache_write = attempt
+            .usage
+            .cache_write_reported
+            .then_some(attempt.usage.cache_write);
+        let price = attempt
+            .price_snapshot
+            .as_ref()
+            .filter(|price| price.model == model)
+            .cloned();
+        let benchmark = attempt
+            .benchmark_snapshot
+            .as_ref()
+            .filter(|price| price.model == model && price.provider == attempt.id)
+            .cloned();
+        let upstream_request_id = attempt
+            .headers
+            .as_ref()
+            .and_then(|headers| {
+                headers
+                    .get("x-request-id")
+                    .or_else(|| headers.get("request-id"))
+            })
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| {
+                value.len() <= 128
+                    && !value.is_empty()
+                    && value.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':')
+                    })
+            });
         let mut entry = serde_json::json!({
             "id":attempt.id, "status":attempt.status, "model":model,
             "requested_model":attempt.model, "kind":attempt.kind, "chosen":chosen,
             "duration_ms":attempt.started.elapsed().as_millis() as u64,
+            "cache_read_tokens":cache_read,"cache_write_tokens":cache_write,"upstream_request_id":upstream_request_id,
+            "price_snapshot":price,"benchmark_snapshot":benchmark,
         });
         if outcome != "ok" {
             entry["reason"] = Value::String(outcome.into());
@@ -1221,11 +2182,28 @@ impl RequestLog {
             self.decision.served_model = Some(model.clone());
             self.decision.input_tokens = attempt.usage.input;
             self.decision.output_tokens = attempt.usage.output;
+            self.decision.cache_read_tokens = cache_read;
+            self.decision.cache_write_tokens = cache_write;
+            self.decision.input_includes_cache = Some(attempt.protocol != WireProtocol::Anthropic);
+            self.decision.price_snapshot = price.clone();
+            self.decision.benchmark_snapshot = benchmark.clone();
         }
-        self.state
-            .update_current_connection(&attempt.id, attempt.connection_version(), || {
+        self.state.update_bound_connection(
+            &attempt.id,
+            attempt.connection_version(),
+            attempt.login(),
+            attempt.cli_epoch(),
+            || {
                 if outcome == "ok" {
                     self.state.apply_success(&attempt.id, now);
+                    if let Some(connection) = &attempt.connection {
+                        self.state.record_source_success(
+                            &attempt.id,
+                            &connection.version,
+                            &connection.quota_subject,
+                            now,
+                        );
+                    }
                     self.state.apply_breaker_success(&attempt.id);
                     if attempt.kind == ProviderKind::Subscription {
                         if let Some(key) = &self.affinity {
@@ -1242,22 +2220,28 @@ impl RequestLog {
                 } else if chosen && outcome == "stream-error" && attempt.stream_limit.is_none() {
                     self.state.apply_breaker_failure(&attempt.id, now);
                 }
-                if let Some(headers) = &attempt.headers {
+                if let (Some(headers), Some(connection)) = (&attempt.headers, &attempt.connection) {
                     observe_quota(
                         &self.state,
                         &attempt.id,
                         attempt.protocol,
                         attempt.codex,
                         headers,
-                        now,
+                        connection.stamp,
+                        &connection.quota_subject,
                     );
                 }
                 if let Some(failure) = &attempt.stream_limit {
                     // A window sample must not replace an explicit terminal limit.
                     failure.apply_health(&self.state, &attempt.id, &attempt.model, now);
                 }
-            });
-        if attempt.usage.input.is_some() || attempt.usage.output.is_some() {
+            },
+        );
+        if attempt.usage.input.is_some()
+            || attempt.usage.output.is_some()
+            || cache_read.is_some()
+            || cache_write.is_some()
+        {
             let accounting = if outcome == "ok"
                 && attempt.usage.input.is_some()
                 && attempt.usage.output.is_some()
@@ -1274,6 +2258,12 @@ impl RequestLog {
                 input_tokens: attempt.usage.input,
                 output_tokens: attempt.usage.output,
                 accounting,
+                request_id: self.decision.request_id.clone(),
+                cache_read_tokens: cache_read,
+                cache_write_tokens: cache_write,
+                input_includes_cache: Some(attempt.protocol != WireProtocol::Anthropic),
+                price_snapshot: price,
+                benchmark_snapshot: benchmark,
             });
         }
     }
@@ -1346,8 +2336,12 @@ impl<'a> From<&'a Candidate> for FailureSource<'a> {
 
 #[derive(Clone, Copy)]
 enum ClientError {
+    Attachment(&'static str),
     InvalidRequest,
     ModelNotFound,
+    ModelNotListed,
+    OutputLimit,
+    ReasoningUnsupported,
     FreeRouteRestricted,
     ContextLength,
     RequestTooLarge,
@@ -1358,8 +2352,12 @@ enum ClientError {
 impl ClientError {
     fn code(self) -> &'static str {
         match self {
+            Self::Attachment(reason) => reason,
             Self::InvalidRequest => "invalid_request",
             Self::ModelNotFound => "model_not_found",
+            Self::ModelNotListed => "model_not_listed",
+            Self::OutputLimit => "output_limit_exceeded",
+            Self::ReasoningUnsupported => "reasoning_unsupported",
             Self::FreeRouteRestricted => openrouter::RESTRICTED,
             Self::ContextLength => "context_length_exceeded",
             Self::RequestTooLarge => "request_too_large",
@@ -1370,6 +2368,22 @@ impl ClientError {
 
     fn response(self, input: Input<'_>) -> Response<Body> {
         let (status, kind, message) = match self {
+            Self::Attachment(reason) => (StatusCode::BAD_REQUEST, "invalid_request_error", reason),
+            Self::ModelNotListed => (
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "model-not-listed: vendor directory does not currently list the configured model",
+            ),
+            Self::OutputLimit => (
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "Requested output exceeds the model's published output limit",
+            ),
+            Self::ReasoningUnsupported => (
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "The model does not support the requested reasoning mode",
+            ),
             Self::InvalidRequest => (
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
@@ -1411,7 +2425,8 @@ impl ClientError {
             ),
         };
         let mut response = match input {
-            Input::Chat(_) | Input::Responses(_) => {
+            Input::Gemini(_) => crate::gemini::error_response(status, message),
+            Input::Chat(_) | Input::Responses(_) | Input::Compact(_) => {
                 chat::error_response(status, message, kind, Some(self.code()))
             }
             Input::Messages(_) => (
@@ -1731,11 +2746,13 @@ fn observe_quota(
     protocol: WireProtocol,
     codex: bool,
     headers: &HeaderMap,
-    now: u64,
+    stamp: ObservationStamp,
+    subject: &str,
 ) {
+    let now = stamp.at;
     if codex {
         let sample = sample_codex_windows(headers, now);
-        state.record_utilization(id, sample.percent_5h, sample.percent_7d);
+        state.commit_passive_quota(id, subject, codex_observations(headers, stamp, &sample));
         if sample.exhausted {
             state.apply_decision(
                 id,
@@ -1754,14 +2771,56 @@ fn observe_quota(
             state.apply_reset_sample(id, reset_at);
         }
     } else if protocol == WireProtocol::Anthropic {
-        let (util_5h, util_7d, reset_at) = sample_anthropic_utilization(headers);
-        if util_5h.is_some() || util_7d.is_some() {
-            state.record_utilization(id, util_5h, util_7d);
-        }
-        if let Some(reset_at) = reset_at {
-            state.apply_reset_sample(id, reset_at);
-        }
+        let (short, week, _) = sample_anthropic_utilization(headers);
+        let windows = [("5h", 18_000, short), ("7d", 604_800, week)]
+            .into_iter()
+            .filter_map(|(window, span, used)| {
+                let used = used?;
+                let reset = header_u64(
+                    headers,
+                    &format!("anthropic-ratelimit-unified-{window}-reset"),
+                );
+                QuotaWindow::new(
+                    span,
+                    used,
+                    reset,
+                    stamp.at,
+                    stamp.sequence,
+                    ObservationSource::ResponseHeaders,
+                )
+            })
+            .collect();
+        state.commit_passive_quota(id, subject, windows);
     }
+}
+
+fn codex_observations(
+    headers: &HeaderMap,
+    stamp: ObservationStamp,
+    sample: &CodexSample,
+) -> Vec<QuotaWindow> {
+    [
+        ("primary", 604_800, sample.percent_7d),
+        ("secondary", 18_000, sample.percent_5h),
+    ]
+    .into_iter()
+    .filter_map(|(window, fallback, used)| {
+        let used = used?;
+        let span = header_u64(headers, &format!("x-codex-{window}-window-minutes"))
+            .and_then(|minutes| minutes.checked_mul(60))
+            .unwrap_or(fallback);
+        let reset = header_u64(headers, &format!("x-codex-{window}-reset-after-seconds"))
+            .map(|seconds| stamp.at.saturating_add(seconds));
+        QuotaWindow::new(
+            span,
+            used,
+            reset,
+            stamp.at,
+            stamp.sequence,
+            ObservationSource::ResponseHeaders,
+        )
+    })
+    .collect()
 }
 
 pub(crate) fn unix_now() -> u64 {
@@ -1941,6 +3000,18 @@ fn loop_guard_answer(model: &str, streaming: bool, input: Input<'_>) -> Response
                 model,
                 unix_now(),
             )
+        } else if matches!(input, Input::Gemini(_)) {
+            match crate::gemini::completion(
+                &message,
+                &local_usage(),
+                WireProtocol::Anthropic,
+                model,
+            ) {
+                Ok(value) => value,
+                Err(reason) => {
+                    return crate::gemini::error_response(StatusCode::BAD_GATEWAY, reason)
+                }
+            }
         } else {
             message
         };

@@ -31,6 +31,8 @@ struct CachedBudget {
     budget: Option<OpenRouterKeyBudget>,
 }
 
+const NEGATIVE_TTL_SECS: u64 = 60;
+
 pub struct OpenRouterKeyFetcher {
     endpoint: String,
     cache: tokio::sync::Mutex<Option<CachedBudget>>,
@@ -96,7 +98,7 @@ pub struct ClaudeUsage {
 pub struct UsageWindow {
     /// 0.0 – 1.0 利用率。
     #[serde(default)]
-    pub utilization: f64,
+    pub utilization: Option<f64>,
     /// ISO8601 重置时刻。
     #[serde(default, rename = "resets_at")]
     pub resets_at: String,
@@ -136,10 +138,10 @@ pub struct CodexWhamUsage {
 
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 pub struct WhamRateLimit {
-    /// primary = 7d 窗口。
+    /// Missing spans keep the historical primary=7d compatibility mapping.
     #[serde(default, rename = "primary_window")]
     pub primary_window: Option<WhamWindow>,
-    /// secondary = 5h 窗口。
+    /// Missing spans keep the historical secondary=5h compatibility mapping.
     #[serde(default, rename = "secondary_window")]
     pub secondary_window: Option<WhamWindow>,
 }
@@ -147,6 +149,8 @@ pub struct WhamRateLimit {
 /// 单窗口:used_percent 为百分比 0–100,reset_at 为 unix 秒。
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 pub struct WhamWindow {
+    #[serde(default)]
+    pub limit_window_seconds: Option<u64>,
     #[serde(default, rename = "used_percent")]
     pub used_percent: Option<f64>,
     #[serde(default, rename = "reset_at")]
@@ -164,7 +168,7 @@ mod tests {
                 "seven_day":{"utilization":0.15,"resets_at":"2026-11-07T00:00:00Z"}}"#,
         )
         .unwrap();
-        assert_eq!(u.five_hour.unwrap().utilization, 0.42);
+        assert_eq!(u.five_hour.unwrap().utilization, Some(0.42));
         assert_eq!(u.seven_day.unwrap().resets_at, "2026-11-07T00:00:00Z");
     }
 
@@ -221,115 +225,107 @@ mod tests {
 // HTTP 拉取(§8.2 纪律:缓存 3 分钟、负缓存 1 分钟、单飞、jitter)
 // ---------------------------------------------------------------------------
 
-use std::sync::Mutex;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
-/// 带缓存的 usage 拉取器(单飞:并发调用共享一次拉取的成果)。
+use crate::quota::{response_text, QuotaCache, QuotaRead};
+use manifest::quota::QuotaIssue;
+
 pub struct UsageFetcher {
     endpoint: String,
-    cache: Mutex<Option<(u64, Option<ClaudeUsage>)>>, // (到期时刻, 结果)
-}
-
-const POSITIVE_TTL_SECS: u64 = 180;
-const NEGATIVE_TTL_SECS: u64 = 60;
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    cache: QuotaCache<ClaudeUsage>,
 }
 
 impl UsageFetcher {
     pub fn new(endpoint: impl Into<String>) -> Self {
         Self {
             endpoint: endpoint.into(),
-            cache: Mutex::new(None),
+            cache: QuotaCache::new(),
         }
     }
 
-    /// 拉取(Bearer token);缓存命中直接返回,负缓存防止错误风暴。
     pub async fn fetch(&self, client: &reqwest::Client, token: &str) -> Option<ClaudeUsage> {
-        {
-            let guard = self.cache.lock().expect("usage cache lock");
-            if let Some((expires, cached)) = &*guard {
-                if now_secs() < *expires {
-                    return cached.clone(); // 单飞成果:并发者直接共享
-                }
-            }
-        }
-        let result = self.fetch_once(client, token).await;
-        let ttl = if result.is_some() {
-            POSITIVE_TTL_SECS
-        } else {
-            NEGATIVE_TTL_SECS
-        };
-        *self.cache.lock().expect("usage cache lock") = Some((now_secs() + ttl, result.clone()));
-        result
+        self.read(client, token).await.value
     }
 
-    async fn fetch_once(&self, client: &reqwest::Client, token: &str) -> Option<ClaudeUsage> {
-        let resp = client
-            .get(&self.endpoint)
-            .bearer_auth(token)
-            .timeout(Duration::from_secs(10))
-            .send()
+    pub async fn read(&self, client: &reqwest::Client, token: &str) -> QuotaRead<ClaudeUsage> {
+        self.cache
+            .read(token, || self.fetch_once(client, token))
             .await
-            .ok()?;
-        let u: ClaudeUsage = resp.json().await.ok()?;
-        Some(u)
+    }
+
+    async fn fetch_once(
+        &self,
+        client: &reqwest::Client,
+        token: &str,
+    ) -> Result<ClaudeUsage, QuotaIssue> {
+        let body = response_text(client.get(&self.endpoint).bearer_auth(token)).await?;
+        let usage: ClaudeUsage =
+            serde_json::from_str(&body).map_err(|_| QuotaIssue::InvalidResponse)?;
+        if usage
+            .five_hour
+            .as_ref()
+            .and_then(|w| w.utilization)
+            .is_none()
+            && usage
+                .seven_day
+                .as_ref()
+                .and_then(|w| w.utilization)
+                .is_none()
+        {
+            return Err(QuotaIssue::Unsupported);
+        }
+        Ok(usage)
     }
 }
 
-/// codex wham/usage 拉取器(缓存口径与 Claude usage 相同:正 3min /
-/// 负 1min,单飞共享;§8.2 主动查询的第二数据源)。
 pub struct WhamFetcher {
     endpoint: String,
-    cache: Mutex<Option<(u64, Option<CodexWhamUsage>)>>,
+    cache: QuotaCache<CodexWhamUsage>,
 }
 
 impl WhamFetcher {
-    /// 生产端点常量(测试注入本地端点)。
     pub const ENDPOINT: &'static str = "https://chatgpt.com/backend-api/wham/usage";
 
     pub fn new(endpoint: impl Into<String>) -> Self {
         Self {
             endpoint: endpoint.into(),
-            cache: Mutex::new(None),
+            cache: QuotaCache::new(),
         }
     }
 
-    /// 拉取(Bearer = codex OAuth access token);缓存命中直接返回,
-    /// 负缓存防止错误风暴。
     pub async fn fetch(&self, client: &reqwest::Client, token: &str) -> Option<CodexWhamUsage> {
-        {
-            let guard = self.cache.lock().expect("wham cache lock");
-            if let Some((expires, cached)) = &*guard {
-                if now_secs() < *expires {
-                    return cached.clone();
-                }
-            }
-        }
-        let result = self.fetch_once(client, token).await;
-        let ttl = if result.is_some() {
-            POSITIVE_TTL_SECS
-        } else {
-            NEGATIVE_TTL_SECS
-        };
-        *self.cache.lock().expect("wham cache lock") = Some((now_secs() + ttl, result.clone()));
-        result
+        self.read(client, token).await.value
     }
 
-    async fn fetch_once(&self, client: &reqwest::Client, token: &str) -> Option<CodexWhamUsage> {
-        let resp = client
-            .get(&self.endpoint)
-            .bearer_auth(token)
-            .timeout(Duration::from_secs(10))
-            .send()
+    pub async fn read(&self, client: &reqwest::Client, token: &str) -> QuotaRead<CodexWhamUsage> {
+        self.cache
+            .read(token, || self.fetch_once(client, token))
             .await
-            .ok()?;
-        let u: CodexWhamUsage = resp.json().await.ok()?;
-        Some(u)
+    }
+
+    async fn fetch_once(
+        &self,
+        client: &reqwest::Client,
+        token: &str,
+    ) -> Result<CodexWhamUsage, QuotaIssue> {
+        let body = response_text(client.get(&self.endpoint).bearer_auth(token)).await?;
+        let usage: CodexWhamUsage =
+            serde_json::from_str(&body).map_err(|_| QuotaIssue::InvalidResponse)?;
+        if usage.rate_limit.as_ref().is_none_or(|limits| {
+            limits
+                .primary_window
+                .as_ref()
+                .and_then(|w| w.used_percent)
+                .is_none()
+                && limits
+                    .secondary_window
+                    .as_ref()
+                    .and_then(|w| w.used_percent)
+                    .is_none()
+        }) {
+            return Err(QuotaIssue::Unsupported);
+        }
+        Ok(usage)
     }
 }
 
@@ -362,7 +358,7 @@ mod fetch_tests {
         let fetcher = UsageFetcher::new(format!("http://{addr}/api/oauth/usage"));
         let client = reqwest::Client::new();
         let u = fetcher.fetch(&client, "tok").await.expect("usage");
-        assert_eq!(u.five_hour.unwrap().utilization, 0.5);
+        assert_eq!(u.five_hour.unwrap().utilization, Some(0.5));
         // 缓存命中:第二次不打服务器。
         fetcher.fetch(&client, "tok").await;
         assert_eq!(hits.load(Ordering::SeqCst), 1);

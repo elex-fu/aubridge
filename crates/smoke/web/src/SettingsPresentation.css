@@ -1,0 +1,17 @@
+.settings-presentation .settings-login-workspace { display: grid; gap: 12px; min-width: 0; }
+.settings-presentation .settings-login-workspace > .panel { margin-bottom: 0; }
+.settings-presentation .settings-current-state { font-size: 14px; line-height: 1.6; margin-bottom: 12px; }
+.settings-presentation .settings-next-action { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin: 12px 0; }
+.settings-presentation .settings-secondary-status { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; padding: 4px 12px; border-top: 1px solid var(--line); }
+.settings-presentation .settings-secondary-status p { margin: 0; font-size: 12px; }
+.settings-presentation .settings-share-control { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin-top: 12px; }
+.settings-presentation .settings-category-summary { padding: 4px 0 12px; }
+.settings-presentation .settings-category-summary h3 { font-size: 14px; margin-bottom: 6px; }
+.settings-presentation .settings-category-summary p { margin: 0; }
+.settings-presentation .settings-backup-stage { padding: 10px 12px; border-left: 3px solid var(--line); background: var(--surface); }
+.settings-presentation .settings-backup-next { margin: 12px 0; }
+.settings-presentation .work-config-pending code { overflow-wrap: anywhere; }
+@media (max-width: 800px) {
+  .settings-presentation .settings-next-action { align-items: flex-start; }
+  .settings-presentation .settings-secondary-status { padding: 4px 0; }
+}

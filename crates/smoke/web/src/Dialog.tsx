@@ -6,6 +6,7 @@ interface DialogProps {
   children: ReactNode;
   onClose: () => void;
   busy?: boolean;
+  active?: boolean;
   label?: string;
   labelledBy?: string;
   describedBy?: string;
@@ -16,10 +17,13 @@ interface DialogProps {
 const FOCUSABLE = 'button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), summary, [tabindex]:not([tabindex="-1"])';
 
 // Keep modal keyboard behavior local to the dialog, including busy close guards.
-export function Dialog({ children, onClose, busy = false, label, labelledBy, describedBy, role = "dialog", className = "" }: DialogProps) {
+export function Dialog({ children, onClose, busy = false, active = true, label, labelledBy, describedBy, role = "dialog", className = "" }: DialogProps) {
   const error = useContext(DialogErrorContext);
   const element = useRef<HTMLDivElement>(null);
   const trigger = useRef(document.activeElement instanceof HTMLElement ? document.activeElement : null);
+  const focused = useRef<HTMLElement | null>(null);
+  const activeNow = useRef(active);
+  activeNow.current = active;
   const close = useRef(onClose);
   const blocked = useRef(busy);
   close.current = onClose;
@@ -27,10 +31,13 @@ export function Dialog({ children, onClose, busy = false, label, labelledBy, des
 
   useLayoutEffect(() => {
     const dialog = element.current;
-    if (!dialog) return;
+    if (!dialog || !active) return;
     const focusable = () => Array.from(dialog.querySelectorAll<HTMLElement>(FOCUSABLE))
       .filter(node => node.tabIndex >= 0 && node.getClientRects().length > 0);
-    if (!dialog.contains(document.activeElement)) (focusable()[0] ?? dialog).focus();
+    if (!dialog.contains(document.activeElement)) {
+      const previous = focused.current;
+      (previous?.isConnected && dialog.contains(previous) && previous.getClientRects().length && !previous.matches(":disabled") ? previous : focusable()[0] ?? dialog).focus();
+    }
     const keydown = (event: KeyboardEvent) => {
       if (event.defaultPrevented) return;
       if (event.key === "Escape") {
@@ -54,15 +61,16 @@ export function Dialog({ children, onClose, busy = false, label, labelledBy, des
     document.addEventListener("keydown", keydown);
     return () => {
       document.removeEventListener("keydown", keydown);
-      if (trigger.current?.isConnected) trigger.current.focus();
+      if (document.activeElement instanceof HTMLElement && dialog.contains(document.activeElement)) focused.current = document.activeElement;
+      if (activeNow.current && trigger.current?.isConnected) trigger.current.focus();
     };
-  }, []);
+  }, [active]);
 
   return (
-    <div className="modal-backdrop" onClick={event => {
-      if (event.target === event.currentTarget && !busy) onClose();
+    <div className={active ? "modal-backdrop" : "modal-suspended"} hidden={!active} onClick={event => {
+      if (active && event.target === event.currentTarget && !busy) onClose();
     }}>
-      <div ref={element} className={`modal ${className}`} role={role} aria-modal="true"
+      <div ref={element} className={`modal ${className}`} role={role} aria-modal={active ? true : undefined}
         aria-label={label} aria-labelledby={labelledBy} aria-describedby={describedBy} tabIndex={-1}>
         {error.message && (
           <div className="alert error modal-error" role="alert">

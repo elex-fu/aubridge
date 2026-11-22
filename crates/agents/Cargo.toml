@@ -6,7 +6,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+manifest = { path = "../manifest" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
+rusqlite = { workspace = true }
 jsonc-parser = { version = "0.34", features = ["cst", "serde"] }
 toml = "1.1"

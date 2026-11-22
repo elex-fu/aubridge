@@ -50,6 +50,8 @@ pub struct ProviderState {
     /// 7d 窗口利用率(百分比 0–100;口径同 `util_5h`)。
     #[serde(default)]
     pub util_7d: Option<f64>,
+    #[serde(default)]
+    pub quota: crate::quota::QuotaState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,6 +107,7 @@ impl ProviderState {
             breaker: BreakerState::default(),
             util_5h: None,
             util_7d: None,
+            quota: crate::quota::QuotaState::default(),
         }
     }
 

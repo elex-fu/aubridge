@@ -409,7 +409,10 @@ fn translate_assistant<'a>(
                 match block {
                     InboundBlock::Text { text: t } => text.push_str(t),
                     // F-3:thinking 整块丢弃,内容与签名都不外泄。
-                    InboundBlock::Thinking { .. } | InboundBlock::NativeOnly => {}
+                    InboundBlock::Thinking { .. }
+                    | InboundBlock::NativeOnly
+                    | InboundBlock::Image { .. }
+                    | InboundBlock::Document { .. } => {}
                     InboundBlock::ToolUse { id, name, input } => {
                         seen_tool_ids.insert(id);
                         tool_calls.push(ChatToolCall {
@@ -456,7 +459,10 @@ fn translate_user<'a>(
             for block in blocks {
                 match block {
                     InboundBlock::Text { text: t } => text.push_str(t),
-                    InboundBlock::Thinking { .. } | InboundBlock::NativeOnly => {}
+                    InboundBlock::Thinking { .. }
+                    | InboundBlock::NativeOnly
+                    | InboundBlock::Image { .. }
+                    | InboundBlock::Document { .. } => {}
                     InboundBlock::ToolResult {
                         tool_use_id,
                         content,

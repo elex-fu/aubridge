@@ -11,6 +11,11 @@
 //(字段已按 magpie internal/agent 核实)。
 
 mod advanced;
+pub mod native_sessions;
+pub mod probe_config;
+pub mod project_check;
+pub mod project_env;
+pub mod readiness;
 use crate::codex::Codex;
 use crate::gemini::GeminiCli;
 use crate::opencode::OpenCode;
@@ -58,7 +63,7 @@ pub trait AgentWiring {
     }
     /// 设置使用的模型(写该 agent 配置的目标字段;agent 之后请求
     /// 带该模型名,网关按模型/自动别名解析候选)。无单一模型字段的
-    /// agent(如 gemini 经 -m 传参)走默认空实现。OpenCode 仅在接线
+    /// agent 走默认空实现。OpenCode 仅在接线
     /// 仍受管时显式选择，并保留首次默认值供断开恢复。
     fn set_model(&self, _model: &str) -> std::io::Result<()> {
         Ok(())

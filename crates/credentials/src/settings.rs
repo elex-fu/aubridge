@@ -55,7 +55,7 @@ fn default_chatgpt_login_source() -> String {
 /// 模型分组(ui-design §6.3,变更记录 32-③):对外名 + 成员模型
 /// (声明序 = 偏好序)+ 路由规则。两类分组同一结构:同名多源映射
 /// (name = 成员模型名,单成员多源)与跨模型合并(自定义 name)。
-/// rule 为 `free_first`/`free_only`/`sequential`/`round_robin`(枚举只
+/// rule 为 `free_first`/`free_only`/`sequential`/`round_robin`/`smart`/`pace`(枚举只
 /// 选择,无规则编辑器——ui-design §10 反目标);坏值留给网关侧
 /// 校验报错(serde 从宽)。
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -64,7 +64,7 @@ pub struct ModelGroup {
     pub name: String,
     #[serde(default)]
     pub members: Vec<String>,
-    /// `free_first` / `free_only` / `sequential` / `round_robin`(缺省 free_first)。
+    /// `free_first` / `free_only` / `sequential` / `round_robin` / `smart` / `pace`(缺省 free_first)。
     #[serde(default = "default_rule")]
     pub rule: String,
 }
@@ -77,7 +77,17 @@ pub struct ModelGroup {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Settings {
     #[serde(default)]
+    pub restored_keychain_only: BTreeSet<String>,
+    #[serde(default)]
+    pub pending_work_config_restore: Option<crate::work_config_backup::PendingRestore>,
+    #[serde(default)]
+    pub cost_intent: Option<crate::usage_policy::CostIntent>,
+    #[serde(default)]
+    pub subscription_authorizations: Vec<crate::usage_policy::SubscriptionAuthorization>,
+    #[serde(default)]
     pub share_login: bool,
+    #[serde(default)]
+    pub claude_cli_enabled: bool,
     /// Invalid configured values remain visible so the gateway can fail closed.
     #[serde(default = "default_chatgpt_login_source")]
     pub chatgpt_login_source: String,
@@ -86,17 +96,28 @@ pub struct Settings {
     #[serde(default)]
     pub model_groups: Vec<ModelGroup>,
     #[serde(default)]
+    pub model_selections: std::collections::BTreeMap<String, Vec<String>>,
+    #[serde(default)]
     pub paused_providers: BTreeSet<String>,
+    #[serde(default)]
+    pub benchmark_mappings: Vec<manifest::model::BenchmarkMapping>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            restored_keychain_only: BTreeSet::new(),
+            pending_work_config_restore: None,
+            cost_intent: None,
+            subscription_authorizations: Vec::new(),
             share_login: false,
+            claude_cli_enabled: false,
             chatgpt_login_source: default_chatgpt_login_source(),
             providers: Vec::new(),
             model_groups: Vec::new(),
+            model_selections: Default::default(),
             paused_providers: BTreeSet::new(),
+            benchmark_mappings: Vec::new(),
         }
     }
 }
@@ -119,12 +140,37 @@ impl Settings {
     /// 红线(绝不基于快照覆盖别人字段)。调用方必须先 load 再改再
     /// save:凭空构造新 Settings 保存会把未携带字段抹成默认值。
     pub fn save(&self, path: &Path) -> io::Result<()> {
+        self.save_document(path, false)
+    }
+
+    /// A fresh explicit D52 choice resolves a restored desired policy in the same atomic write.
+    pub fn save_confirmed_cost_policy(&self, path: &Path) -> io::Result<()> {
+        self.save_document(path, true)
+    }
+
+    fn save_document(&self, path: &Path, confirmed_cost_policy: bool) -> io::Result<()> {
         let (mut v, _) = read_document(path)?;
+        if confirmed_cost_policy {
+            if let Some(document) = v.as_object_mut() {
+                document.remove("restored_desired_cost_intent");
+            }
+        }
+        v["restored_keychain_only"] = serde_json::json!(self.restored_keychain_only);
+        if let Some(pending) = &self.pending_work_config_restore {
+            v["pending_work_config_restore"] = serde_json::json!(pending);
+        } else if let Some(document) = v.as_object_mut() {
+            document.remove("pending_work_config_restore");
+        }
+        v["cost_intent"] = serde_json::json!(self.cost_intent);
+        v["subscription_authorizations"] = serde_json::json!(self.subscription_authorizations);
         v["share_login"] = serde_json::json!(self.share_login);
+        v["claude_cli_enabled"] = serde_json::json!(self.claude_cli_enabled);
         v["chatgpt_login_source"] = serde_json::json!(self.chatgpt_login_source);
         v["providers"] = serde_json::json!(self.providers);
         v["model_groups"] = serde_json::json!(self.model_groups);
+        v["model_selections"] = serde_json::json!(self.model_selections);
         v["paused_providers"] = serde_json::json!(self.paused_providers);
+        v["benchmark_mappings"] = serde_json::json!(self.benchmark_mappings);
         let text = serde_json::to_string_pretty(&v).map_err(io::Error::other)?;
         atomic_write(path, text.as_bytes())
     }

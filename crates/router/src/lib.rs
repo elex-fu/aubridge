@@ -10,6 +10,7 @@ pub mod classify;
 pub mod group;
 pub mod guard;
 pub mod plan;
+mod quota;
 pub mod rest;
 
 pub use breaker::{record_failure, record_success};

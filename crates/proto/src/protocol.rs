@@ -268,6 +268,14 @@ pub enum InboundContent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum InboundBlock {
+    Image {
+        source: MediaSource,
+    },
+    Document {
+        source: MediaSource,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+    },
     Text {
         text: String,
     },
@@ -295,12 +303,34 @@ pub enum InboundBlock {
     NativeOnly,
 }
 
+/// Portable attachment source; opaque IDs remain tied to their original wire.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum MediaSource {
+    Base64 {
+        media_type: String,
+        data: String,
+    },
+    Text {
+        media_type: String,
+        data: String,
+    },
+    Url {
+        url: String,
+    },
+    File {
+        file_id: String,
+    },
+    #[serde(other)]
+    Unsupported,
+}
+
 /// tool_result 的 content:字符串或块数组。缺省视为空文本。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ToolResultContent {
     Text(String),
-    Blocks(Vec<InboundTextBlock>),
+    Blocks(Vec<InboundBlock>),
 }
 
 impl Default for ToolResultContent {
@@ -310,13 +340,37 @@ impl Default for ToolResultContent {
 }
 
 impl ToolResultContent {
+    /// Preserve the established text-only wire shape; media keeps ordered blocks.
+    pub fn from_blocks(blocks: Vec<InboundBlock>) -> Self {
+        if blocks
+            .iter()
+            .all(|block| matches!(block, InboundBlock::Text { .. }))
+        {
+            Self::Text(
+                blocks
+                    .into_iter()
+                    .filter_map(|block| match block {
+                        InboundBlock::Text { text } => Some(text),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+        } else {
+            Self::Blocks(blocks)
+        }
+    }
+
     /// 展开成纯文本(Chat `tool` 消息只吃文本)。
     pub fn as_text(&self) -> String {
         match self {
             ToolResultContent::Text(s) => s.clone(),
             ToolResultContent::Blocks(blocks) => blocks
                 .iter()
-                .map(|b| b.text.as_str())
+                .filter_map(|b| match b {
+                    InboundBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
                 .collect::<Vec<_>>()
                 .join("\n"),
         }

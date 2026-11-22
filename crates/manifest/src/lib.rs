@@ -5,6 +5,8 @@
 //! 零 IO、零重依赖(serde 之外),`state::ProviderState` 是 router 的
 //! 纯函数输入快照。
 
+pub mod model;
+pub mod quota;
 pub mod schema;
 pub mod state;
 

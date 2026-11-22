@@ -29,6 +29,10 @@ pub enum GroupRule {
     /// 轮流:每轮换下一个——整表按请求计数
     /// 轮转(成员间/成员内一起轮,尽力语义,不持久)。
     RoundRobin,
+    /// Free tier first, then subscriptions whose main window renews soonest.
+    Smart,
+    /// Free tier first, then subscriptions with most quota left per hour.
+    Pace,
 }
 
 impl GroupRule {
@@ -40,6 +44,8 @@ impl GroupRule {
             "free_only" => Some(Self::FreeOnly),
             "sequential" => Some(Self::Sequential),
             "round_robin" => Some(Self::RoundRobin),
+            "smart" => Some(Self::Smart),
+            "pace" => Some(Self::Pace),
             _ => None,
         }
     }
@@ -51,11 +57,17 @@ impl GroupRule {
             Self::FreeOnly => "free_only",
             Self::Sequential => "sequential",
             Self::RoundRobin => "round_robin",
+            Self::Smart => "smart",
+            Self::Pace => "pace",
         }
     }
 
     pub fn allows_provider(self, kind: ProviderKind) -> bool {
         self != Self::FreeOnly || kind == ProviderKind::FreeTier
+    }
+
+    pub fn prefers_free(self) -> bool {
+        matches!(self, Self::FreeFirst | Self::Smart | Self::Pace)
     }
 }
 
@@ -70,7 +82,9 @@ pub fn candidates_named_group<'a>(
     rotation: u64,
 ) -> Vec<ModelCandidate<'a>> {
     let mut candidates = match rule {
-        GroupRule::FreeFirst | GroupRule::FreeOnly => candidates_group(members, states, now),
+        GroupRule::FreeFirst | GroupRule::FreeOnly | GroupRule::Smart | GroupRule::Pace => {
+            candidates_group(members, states, now)
+        }
         GroupRule::RoundRobin => members_in_order(members, states, now),
         GroupRule::Sequential => collect_members(members, |member| {
             states
@@ -94,6 +108,14 @@ pub fn candidates_named_group<'a>(
     if rule == GroupRule::RoundRobin && !candidates.is_empty() {
         let offset = (rotation as usize) % candidates.len();
         candidates.rotate_left(offset);
+    }
+    if matches!(rule, GroupRule::Smart | GroupRule::Pace) {
+        let policy = if rule == GroupRule::Smart {
+            crate::quota::QuotaPolicy::Smart
+        } else {
+            crate::quota::QuotaPolicy::Pace
+        };
+        crate::quota::prioritize(&mut candidates, policy, now);
     }
     candidates
 }

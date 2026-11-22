@@ -131,11 +131,12 @@ async fn discover(state: &GatewayState, id: &str) -> Result<Vec<String>, Issue> 
     ));
     request = match credential {
         Credential::Key(key) => match manifest.provider.auth {
+            AuthKind::ClaudeCli => request,
             AuthKind::Bearer => request.bearer_auth(key),
             AuthKind::ApiKey => request.header("x-api-key", key),
         },
         Credential::Local => request,
-        Credential::ChatGpt => return Err(Issue::UnsupportedProvider),
+        Credential::ClaudeCli | Credential::ChatGpt => return Err(Issue::UnsupportedProvider),
     };
     let result = tokio::time::timeout(TIMEOUT, async {
         let response = request.send().await.map_err(|_| Issue::Network)?;

@@ -24,7 +24,7 @@ use credentials::refresh::{refresh_via_http, RefreshOutcome};
 /// 安全红线明令禁止)。
 pub const CODEX_USER_AGENT: &str = "codex_cli_rs/0.166.0 (Mac OS 15.6; arm64) xterm-256color";
 
-const CODEX_ORIGINATOR: &str = "codex_cli_rs";
+pub(crate) const CODEX_ORIGINATOR: &str = "codex_cli_rs";
 const CODEX_OPENAI_BETA: &str = "responses=experimental";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -83,6 +83,24 @@ impl std::ops::Deref for LoginSnapshot {
 
     fn deref(&self) -> &Self::Target {
         &self.login.effective
+    }
+}
+
+impl LoginSnapshot {
+    pub(crate) fn compaction_subject(&self) -> String {
+        credentials::quota::subject_tag(
+            "compaction-login",
+            &format!(
+                "{}:{}",
+                self.login.source.kind.as_str(),
+                self.quota_subject()
+            ),
+        )
+    }
+
+    pub(crate) fn quota_subject(&self) -> String {
+        let identity = cgpt::resolve_account_id(self).unwrap_or_else(|| self.access_token.clone());
+        credentials::quota::subject_tag("chatgpt-account", &identity)
     }
 }
 
@@ -248,6 +266,11 @@ impl ChatGptChannel {
         self.current().is_some()
     }
 
+    /// Restore previews validate the requested login source without changing the active one.
+    pub(crate) fn has_login_for(&self, source: LoginSource) -> bool {
+        self.read_login(source).ok().flatten().is_some()
+    }
+
     fn read_login(&self, source: LoginSource) -> io::Result<Option<FileLogin>> {
         match source {
             LoginSource::Codex => Ok(read_codex_login(&self.auth_json, &self.config_toml)?
@@ -312,6 +335,50 @@ impl ChatGptChannel {
             login,
             refreshed: false,
         })
+    }
+
+    /// Polling quota alone must not rotate a CLI's real refresh token.
+    pub(crate) fn quota_snapshot(&self) -> Option<LoginSnapshot> {
+        self.current()
+    }
+
+    /// A response on the same account may finish across its ordinary token
+    /// refresh, but never across a selected-source change or logout.
+    pub(crate) fn update_current_quota_login(
+        &self,
+        snapshot: &LoginSnapshot,
+        update: impl FnOnce(),
+    ) {
+        let mut state = self.login.lock().expect("chatgpt login lock");
+        if !Arc::ptr_eq(&state.selection, &snapshot.selection) {
+            return;
+        }
+        let Ok(Some(current)) = self.reconcile(&mut state) else {
+            return;
+        };
+        let current_identity = cgpt::resolve_account_id(&current.effective)
+            .unwrap_or_else(|| current.effective.access_token.clone());
+        let current_subject = credentials::quota::subject_tag("chatgpt-account", &current_identity);
+        if current_subject == snapshot.quota_subject() {
+            update();
+        }
+    }
+
+    /// Commit a quota read only to the login that sent it. Reconcile while
+    /// holding the selection lock so a source switch cannot race the commit.
+    pub(crate) fn update_current_login(&self, snapshot: &LoginSnapshot, update: impl FnOnce()) {
+        let mut state = self.login.lock().expect("chatgpt login lock");
+        if !Arc::ptr_eq(&state.selection, &snapshot.selection) {
+            return;
+        }
+        let Ok(Some(current)) = self.reconcile(&mut state) else {
+            return;
+        };
+        if Arc::ptr_eq(&current.source, &snapshot.login.source)
+            && Arc::ptr_eq(&current.effective, &snapshot.login.effective)
+        {
+            update();
+        }
     }
 
     /// 发送前取凭据(§7):access token 余量 < 5 分钟先主动刷新。

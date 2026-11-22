@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-"""Build a signed local development bundle and install it after the app quits.
+"""Build/verify a commit-bound macOS package; install with automatic recovery.
 
-Receipts bind the complete bundle to a clean Git commit. Installation preserves
-the previous app and leaves credentials, configuration and the ledger in place.
-This ad-hoc signed development package is not a notarized public release.
+Development builds are ad-hoc signed. Distribution builds require Developer ID
+and notarization credentials and never silently fall back to a development app.
 """
 
 import argparse
-import hashlib
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -15,174 +14,76 @@ import plistlib
 import shutil
 import subprocess
 import sys
-import time
-from datetime import datetime, timezone
-import urllib.parse
-import urllib.request
+import tempfile
+
+from clean_source import check, checkout
+from release_common import (ROOT, archive_app, check_app, copy_app, digest, distribution_preflight,
+                            manifest, run, unpack_archive, write_json)
+from release_install import Installer
 
 
-ROOT = Path(__file__).resolve().parent.parent
-BUNDLE_ID = "dev.aubridge.smoke"
-INSTALL_PATH = Path.home() / "Applications/aubridge.app"
-
-
-def run(args, *, cwd=ROOT, log=None):
-    if log is None:
-        return subprocess.check_output(args, cwd=cwd, text=True).strip()
-    print(f"Running {args[0]} {args[1] if len(args) > 1 else ''}: {log}", flush=True)
-    with log.open("w") as output:
-        subprocess.run(args, cwd=cwd, stdout=output, stderr=subprocess.STDOUT, check=True)
-    return None
-
-
-def digest(path):
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-def manifest(app):
-    files = {}
-    for path in sorted(app.rglob("*")):
-        name = str(path.relative_to(app))
-        if path.is_symlink():
-            files[name] = "symlink:" + os.readlink(path)
-        elif path.is_file():
-            files[name] = digest(path)
-    return files
-
-
-def write_json(path, value):
-    path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
-
-
-def check_app(app, expected=None):
-    info = plistlib.loads((app / "Contents/Info.plist").read_bytes())
-    if info.get("CFBundleIdentifier") != BUNDLE_ID:
-        raise RuntimeError("Unexpected application identity")
-    run(["codesign", "--verify", "--deep", "--strict", str(app)])
-    if expected is not None and manifest(app) != expected:
-        raise RuntimeError("Bundle manifest does not match the build receipt")
-
-
-def build(output_dir):
+def build(output_dir, *, mode="development", profile="release"):
     if run(["git", "status", "--porcelain", "--untracked-files=normal"]):
         raise RuntimeError("Commit the source baseline before packaging (working tree is dirty)")
+    distribution = mode == "distribution"
+    if distribution:
+        distribution_preflight(os.environ)
+        if profile != "release":
+            raise RuntimeError("Distribution requires the release profile")
     revision = run(["git", "rev-parse", "HEAD"])
     created = datetime.now(timezone.utc)
-    stage = output_dir / f"{revision[:12]}-{created.strftime('%Y%m%dT%H%M%SZ')}"
-    stage.mkdir(parents=True)
-    run(["zsh", str(ROOT / "scripts/check.zsh")], log=stage / "checks.log")
-    run(
-        ["cargo", "tauri", "build", "--debug", "--bundles", "app", "--ci", "--", "--locked"],
-        cwd=ROOT / "crates/smoke", log=stage / "bundle.log",
-    )
-    metadata = json.loads(run(["cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"]))
-    source = Path(metadata["target_directory"]) / "debug/bundle/macos/aubridge.app"
-    app = stage / "aubridge.app"
-    shutil.copytree(source, app, symlinks=True)
-    build_info = {
-        "git_revision": revision,
-        "git_tree": run(["git", "rev-parse", "HEAD^{tree}"]),
-        "created_utc": created.isoformat(),
-        "profile": "debug",
-        "signing": "local-ad-hoc",
-        "rustc": run(["rustc", "--version"]),
-        "node": run(["node", "--version"]),
-        "tauri_cli": run(["cargo", "tauri", "--version"]),
-    }
-    resources = app / "Contents/Resources"
-    resources.mkdir(exist_ok=True)
-    write_json(resources / "aubridge-build.json", build_info)
-    plist_path = app / "Contents/Info.plist"
-    plist = plistlib.loads(plist_path.read_bytes())
-    plist["AubridgeGitRevision"] = revision
-    plist_path.write_bytes(plistlib.dumps(plist))
-    run(
-        ["codesign", "--force", "--sign", "-", "--identifier", BUNDLE_ID,
-         "--timestamp=none", str(app)], log=stage / "codesign.log",
-    )
-    check_app(app)
-    if run(["git", "status", "--porcelain", "--untracked-files=normal"]):
-        raise RuntimeError("Source changed during the build; this candidate cannot be released")
-    receipt = {**build_info, "app": str(app.resolve()), "files": manifest(app)}
+    stage = output_dir / f"{revision[:12]}-{created.strftime('%Y%m%dT%H%M%S.%fZ')}"
+    stage.mkdir(parents=True, mode=0o700)
+    with checkout(stage, revision, signing=distribution) as (source, env, identity):
+        checked = check(source, env, stage, identity)
+        config = json.loads((source / "crates/smoke/tauri.conf.json").read_text())
+        build_info = {**checked, "created_utc": created.isoformat(), "profile": profile,
+                      "version": config["version"], "mode": mode,
+                      "signing_requested": "developer-id" if distribution else "local-ad-hoc",
+                      "target": run(["rustc", "-vV"], cwd=source, env=env).split("host: ")[1].splitlines()[0],
+                      "tauri_cli": run(["cargo", "tauri", "--version"], cwd=source, env=env)}
+        write_json(stage / "aubridge-build.json", build_info)
+        (stage / "Info.plist").write_bytes(plistlib.dumps({"AubridgeGitRevision": revision}))
+        override = {"bundle": {"resources": {str(stage / "aubridge-build.json"): "aubridge-build.json"},
+                    "macOS": {"infoPlist": str(stage / "Info.plist"), "hardenedRuntime": True}}}
+        if not distribution:
+            # Strip all Apple secrets from dev builds; Tauri signs before packaging.
+            env["APPLE_SIGNING_IDENTITY"] = "-"
+            override["bundle"]["macOS"]["signingIdentity"] = "-"
+        write_json(stage / "tauri.release.json", override)
+        env.update(AUBRIDGE_BUILD_REVISION=revision, AUBRIDGE_BUILD_TREE=identity["git_tree"],
+                   AUBRIDGE_BUILD_MODE=mode, AUBRIDGE_SOURCE_VERIFIED="1")
+        command = ["cargo", "tauri", "build", "--bundles", "app", "--ci",
+                   "--config", str(stage / "tauri.release.json")]
+        if profile == "debug":
+            command.append("--debug")
+        command.extend(("--", "--locked"))
+        # The package output must be private, even when the check gate shares a cache.
+        env["CARGO_TARGET_DIR"] = str(stage / "target")
+        run(command, cwd=source / "crates/smoke", env=env, log=stage / "bundle.log")
+        app = stage / "aubridge.app"
+        copy_app(Path(env["CARGO_TARGET_DIR"]) / profile / "bundle/macos/aubridge.app", app)
+        verification = check_app(app, distribution=distribution,
+                                team_id=env.get("APPLE_TEAM_ID"), revision=revision)
+        archive = stage / f"aubridge-{config['version']}-{build_info['target']}-{mode}.zip"
+        archive_app(app, archive)
+        receipt = {**build_info, "schema": 2, "app": "aubridge.app", "files": manifest(app),
+                   "signing": "developer-id-notarized" if distribution else "local-ad-hoc",
+                   "runtime_contract": ["request_limits", "value_summary", "build_identity"],
+                   "team_id": env.get("APPLE_TEAM_ID") if distribution else None,
+                   "verification": verification,
+                   "archive": {"name": archive.name, "size": archive.stat().st_size,
+                               "sha256": digest(archive)}}
+        # Verify the distributed bytes, including notarization, after an archive round trip.
+        with tempfile.TemporaryDirectory(prefix="aubridge-archive-", dir=stage) as temporary:
+            unpacked = unpack_archive(archive, receipt, Path(temporary) / "unpacked")
+            check_app(unpacked, receipt["files"], distribution=distribution,
+                      team_id=receipt["team_id"], revision=revision)
+        shutil.rmtree(stage / "target")
     write_json(stage / "receipt.json", receipt)
-    print(f"Built and verified: {stage / 'receipt.json'}")
-
-
-def running_pids():
-    executable = str(INSTALL_PATH / "Contents/MacOS/smoke")
-    rows = run(["ps", "-axo", "pid=,comm="]).splitlines()
-    return [int(row.split(None, 1)[0]) for row in rows
-            if len(row.split(None, 1)) == 2 and row.split(None, 1)[1] == executable]
-
-
-def verify_runtime():
-    session_path = Path.home() / ".aubridge/gateway-session.json"
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    for _ in range(30):
-        try:
-            session = json.loads(session_path.read_text())
-            endpoint = session["endpoint"]
-            target = urllib.parse.urlsplit(endpoint)
-            if (target.scheme != "http" or target.hostname != "127.0.0.1"
-                    or target.username or target.password or not target.port
-                    or target.path not in ("", "/") or target.query or target.fragment):
-                raise RuntimeError("Unexpected gateway session endpoint")
-            statuses = {}
-            for route in ("/healthz", "/admin/quota-history", "/admin/import/cc-switch"):
-                request = urllib.request.Request(
-                    endpoint + route,
-                    headers={"Authorization": "Bearer " + session["admin_token"]},
-                )
-                with opener.open(request, timeout=5) as response:
-                    statuses[route] = response.status
-            pids = running_pids()
-            if pids and all(value == 200 for value in statuses.values()):
-                return {"endpoint": endpoint, "pids": pids, "http_status": statuses}
-        except (OSError, ValueError, KeyError):
-            pass
-        time.sleep(1)
-    raise RuntimeError("Installed app did not become healthy; the previous bundle is preserved")
-
-
-def install(receipt_path, receipt):
-    source = Path(receipt["app"])
-    check_app(source, receipt["files"])
-    if running_pids():
-        raise RuntimeError("Quit aubridge from its application menu before installing; in-flight work must drain")
-    backup = receipt_path.parent / "installed-before.app"
-    pending = INSTALL_PATH.with_name(f".aubridge-install-{os.getpid()}.app")
-    if pending.exists() or backup.exists():
-        raise RuntimeError("Installation staging or backup already exists; inspect it before retrying")
-    if INSTALL_PATH.is_symlink():
-        raise RuntimeError("Refusing to replace a symlink at the application install path")
-    if INSTALL_PATH.exists():
-        info = plistlib.loads((INSTALL_PATH / "Contents/Info.plist").read_bytes())
-        if info.get("CFBundleIdentifier") != BUNDLE_ID:
-            raise RuntimeError("Refusing to replace a different application")
-    INSTALL_PATH.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(source, pending, symlinks=True)
-    check_app(pending, receipt["files"])
-    if INSTALL_PATH.exists():
-        INSTALL_PATH.rename(backup)
-    try:
-        pending.rename(INSTALL_PATH)
-        check_app(INSTALL_PATH, receipt["files"])
-    except Exception:
-        if backup.exists():
-            if INSTALL_PATH.exists():
-                INSTALL_PATH.rename(pending)
-            backup.rename(INSTALL_PATH)
-        raise
-    run(["open", "-g", str(INSTALL_PATH)])
-    observed = verify_runtime()
-    result = {
-        "git_revision": receipt["git_revision"], "installed_app": str(INSTALL_PATH),
-        "previous_app": str(backup) if backup.exists() else None,
-        "executable_sha256": digest(INSTALL_PATH / "Contents/MacOS/smoke"),
-        **observed,
-    }
-    write_json(receipt_path.parent / "installation.json", result)
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+    (stage / "SHA256SUMS").write_text(f"{digest(archive)}  {archive.name}\n")
+    print(f"Built and verified {mode} package: {stage / 'receipt.json'}")
+    return stage
 
 
 def main():
@@ -190,29 +91,72 @@ def main():
     subparsers = parser.add_subparsers(dest="command", required=True)
     build_parser = subparsers.add_parser("build")
     build_parser.add_argument("--output-dir", type=Path, default=ROOT / ".local/releases")
-    for name in ("install", "verify"):
+    build_parser.add_argument("--mode", choices=("development", "distribution"), default="development")
+    build_parser.add_argument("--profile", choices=("debug", "release"), default="release")
+    subparsers.add_parser("preflight", help="Validate the formal distribution environment")
+    for name in ("install", "verify", "recover"):
         child = subparsers.add_parser(name)
-        child.add_argument("receipt", type=Path)
-        if name == "verify":
-            child.add_argument("--app", type=Path)
+        if name != "recover":
+            child.add_argument("receipt", type=Path)
+            child.add_argument("--archive", type=Path)
+            child.add_argument("--team-id", help="Trusted Developer ID Team, outside the receipt")
+        child.add_argument("--app", type=Path, default=None)
+        if name in ("install", "recover"):
+            child.add_argument("--home", type=Path, help="Private application HOME for acceptance")
+            child.add_argument("--data-dir", type=Path)
+            child.add_argument("--timeout", type=float, default=30)
+        if name == "install":
+            child.add_argument("--allow-development", action="store_true")
     args = parser.parse_args()
     if sys.platform != "darwin":
-        parser.error("This local package workflow requires macOS")
+        parser.error("This package workflow requires macOS")
     if args.command == "build":
-        build(args.output_dir.resolve())
-    else:
-        path = args.receipt.resolve()
-        receipt = json.loads(path.read_text())
-        if args.command == "install":
-            install(path, receipt)
+        build(args.output_dir.resolve(), mode=args.mode, profile=args.profile)
+        return
+    if args.command == "preflight":
+        distribution_preflight(os.environ)
+        print("Distribution environment present; signing/notarization still require a successful build")
+        return
+    if args.command == "recover":
+        if args.timeout <= 0:
+            parser.error("--timeout must be positive")
+        installer = Installer(args.app or Path.home() / "Applications/aubridge.app",
+                              home=args.home, data_dir=args.data_dir, timeout=args.timeout)
+        result = installer.recover()
+        print(f"Recovery state: {result['phase']}; journal: {installer.journal_path}")
+        return
+    path = args.receipt.resolve()
+    receipt = json.loads(path.read_text())
+    distribution = receipt.get("signing") == "developer-id-notarized"
+    if distribution and args.command == "verify" and not args.team_id:
+        parser.error("--team-id is required to verify a distribution package")
+    with tempfile.TemporaryDirectory(prefix="aubridge-package-") as temporary:
+        if receipt.get("schema") == 2:
+            archive = args.archive or path.parent / receipt["archive"]["name"]
+            source = unpack_archive(archive, receipt, Path(temporary) / "unpacked")
         else:
-            check_app(args.app or Path(receipt["app"]), receipt["files"])
-            print("Bundle identity, strict signature and complete manifest verified")
+            if args.command != "verify":
+                parser.error("Historical receipts support verify only; rebuild before installing")
+            source = Path(receipt["app"])
+        if args.command == "verify":
+            check_app(args.app or source, receipt["files"], distribution=distribution,
+                      team_id=args.team_id, revision=receipt.get("git_revision"))
+            print("Archive, complete manifest, source revision and signature verified")
+        else:
+            if args.timeout <= 0:
+                parser.error("--timeout must be positive")
+            installer = Installer(args.app or Path.home() / "Applications/aubridge.app",
+                                  home=args.home, data_dir=args.data_dir, timeout=args.timeout)
+            result = installer.install(source, receipt, allow_development=args.allow_development,
+                                       team_id=args.team_id)
+            write_json(path.parent / "installation.json", result)
+            print(f"Installed {result['git_revision']}; listener PID verified; journal: {installer.journal_path}")
 
 
 if __name__ == "__main__":
     try:
         main()
-    except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
+    except (OSError, ValueError, KeyError, RuntimeError, subprocess.CalledProcessError) as error:
+        # Print no captured command output: it may include signing-service details.
         print(f"release-macos: {error}", file=sys.stderr)
         sys.exit(1)

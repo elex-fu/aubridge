@@ -20,6 +20,7 @@ impl ChatInput {
     pub fn parse(body: &str) -> Result<Self, &'static str> {
         let raw: Value = serde_json::from_str(body).map_err(|_| "Invalid JSON request")?;
         let object = raw.as_object().ok_or("Expected a Chat request object")?;
+        crate::media::validate_raw(&raw, crate::media::Wire::Chat)?;
         let model = required_text(&raw["model"], "A model is required")?;
         let messages = raw["messages"]
             .as_array()
@@ -74,6 +75,9 @@ impl ChatInput {
             }
             match role {
                 "system" | "developer" => {
+                    native_only |= content
+                        .iter()
+                        .any(|b| !matches!(b, InboundBlock::Text { .. }));
                     let text = text_of(content);
                     if !text.is_empty() {
                         native_only |= !translated.is_empty();
@@ -124,7 +128,7 @@ impl ChatInput {
                     let id =
                         required_text(&message["tool_call_id"], "A tool result needs its call ID")?;
                     native_only |= !calls.remove(id);
-                    push_tool_result(&mut translated, id, text_of(content));
+                    push_tool_result(&mut translated, id, content);
                 }
                 _ => native_only = true,
             }
@@ -157,6 +161,7 @@ impl ChatInput {
             thinking: None,
             output_config: None,
         };
+        crate::media::check(&request, crate::media::Wire::Chat, true)?;
         Ok(Self {
             request,
             include_usage,
@@ -263,8 +268,14 @@ fn content_blocks(
                 blocks.extend(text_block(
                     part["text"].as_str().ok_or("Invalid text content")?,
                 ));
+            } else if let Some(block) = crate::media::parse_part(part, crate::media::Wire::Chat)? {
+                *native_only |= part["image_url"]["detail"]
+                    .as_str()
+                    .is_some_and(|v| v != "auto");
+                blocks.push(block);
             } else {
                 *native_only = true;
+                blocks.push(InboundBlock::NativeOnly);
             }
         }
         Ok(blocks)
@@ -284,10 +295,10 @@ fn text_of(blocks: Vec<InboundBlock>) -> String {
         .join("\n")
 }
 
-fn push_tool_result(messages: &mut Vec<InboundMessage>, id: &str, content: String) {
+fn push_tool_result(messages: &mut Vec<InboundMessage>, id: &str, content: Vec<InboundBlock>) {
     let block = InboundBlock::ToolResult {
         tool_use_id: id.into(),
-        content: ToolResultContent::Text(content),
+        content: ToolResultContent::from_blocks(content),
         is_error: false,
     };
     if let Some(InboundMessage {

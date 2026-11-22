@@ -1,0 +1,6 @@
+{
+  "native_id": "c18365a3-0000-4000-8000-000000000001",
+  "header": "x-session-id: c18365a3-0000-4000-8000-000000000001",
+  "seed_source": "caller_explicit_seed",
+  "resume_source": "product_launcher_explicit_resume"
+}

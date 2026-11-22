@@ -1,17 +1,29 @@
 //! ledger —— quota ledger(设计文档 §8.3)。
 //!
 //! 纪律(model-router):**未定价模型记 null,不伪造成本**;记账状态机
-//! reported / partial / estimated 自描述可信度。"省了 $X" = 对标模型
-//! 单价 × 免费与订阅用量(发布口径),`null` 价格不计入。
+//! reported / partial / estimated 自描述可信度。API 等值按当次价格和
+//! 已知的普通输入/缓存/输出折算，未知价格为 null，覆盖率独立展示。
 
 use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
+mod analytics;
+pub use analytics::{AnalyticsContext, AnalyticsError, AnalyticsReport, AnalyticsWindow};
+
+mod quota;
+mod session;
+mod validation;
+mod value;
+pub use session::{SessionPage, SessionSource, SessionSummary};
+pub use validation::ValidationRequest;
+pub use value::{Estimate, PriceSnapshot, ProviderValue, ValueSummary};
+
 /// 记账状态(§8.3 状态机)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Accounting {
     Reported,
+    #[default]
     Partial,
     Estimated,
 }
@@ -27,7 +39,7 @@ impl Accounting {
 }
 
 /// 一条用量记录。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct UsageRecord {
     pub ts: u64,
     pub agent: String,
@@ -36,11 +48,20 @@ pub struct UsageRecord {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub accounting: Accounting,
+    pub request_id: Option<String>,
+    pub cache_read_tokens: Option<u64>,
+    pub cache_write_tokens: Option<u64>,
+    pub input_includes_cache: Option<bool>,
+    pub price_snapshot: Option<PriceSnapshot>,
+    pub benchmark_snapshot: Option<PriceSnapshot>,
 }
 
 /// 一条请求完成记录。旧账本的实际模型、用量和耗时可为空。
 #[derive(Debug, Clone, Default)]
 pub struct DecisionRecord {
+    pub session_id: Option<String>,
+    pub parent_session_id: Option<String>,
+    pub purpose: Option<String>,
     pub ts: u64,
     /// 请求模型(group 语法原样)。
     pub model: String,
@@ -58,10 +79,20 @@ pub struct DecisionRecord {
     pub output_tokens: Option<u64>,
     pub first_content_ms: Option<u64>,
     pub duration_ms: Option<u64>,
+    pub request_id: Option<String>,
+    pub request_path: Option<String>,
+    pub request_bytes: Option<u64>,
+    pub cache_read_tokens: Option<u64>,
+    pub cache_write_tokens: Option<u64>,
+    pub input_includes_cache: Option<bool>,
+    pub price_snapshot: Option<PriceSnapshot>,
+    pub benchmark_snapshot: Option<PriceSnapshot>,
 }
 
 #[derive(Default)]
 pub struct DecisionFilter<'a> {
+    pub session_id: Option<&'a str>,
+    pub request_id: Option<&'a str>,
     pub agent: Option<&'a str>,
     pub provider: Option<&'a str>,
     pub related_provider: Option<&'a str>,
@@ -115,13 +146,7 @@ pub fn benchmark_price(model: &str) -> Option<(f64, f64)> {
 impl UsageRecord {
     /// 已报告数量的对标成本($)。未定价或双方用量均未知时返回 None。
     pub fn benchmark_cost(&self) -> Option<f64> {
-        let (pin, pout) = benchmark_price(&self.model)?;
-        if self.input_tokens.is_none() && self.output_tokens.is_none() {
-            return None;
-        }
-        let input = self.input_tokens.unwrap_or_default() as f64 * pin / 1e6;
-        let output = self.output_tokens.unwrap_or_default() as f64 * pout / 1e6;
-        Some(input + output)
+        self.estimate().map(|estimate| estimate.api_equivalent_usd)
     }
 }
 
@@ -155,6 +180,8 @@ pub struct QuotaPointRow {
     /// 剩余百分比 0–100。
     pub left: f64,
     pub resets_at: Option<u64>,
+    pub span_secs: Option<u64>,
+    pub legacy: bool,
 }
 
 /// 周期判定(magpie newCycle 口径):b 读于 a 之后,是否为窗口
@@ -188,6 +215,27 @@ pub struct Ledger {
 }
 
 impl Ledger {
+    /// Checkpoint digests never contain ciphertext or credentials. Conflicts are immutable.
+    pub fn compaction_owner(&self, digest: &str) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT owner FROM compaction_owners WHERE digest=?1",
+                [digest],
+                |r| r.get(0),
+            )
+            .optional()
+    }
+
+    pub fn save_compaction_owner(
+        &self,
+        digest: &str,
+        owner: &str,
+        now: u64,
+    ) -> rusqlite::Result<bool> {
+        self.conn.execute("INSERT OR IGNORE INTO compaction_owners(digest,owner,created_at) SELECT ?1,?2,?3 WHERE (SELECT count(*) FROM compaction_owners) < 50000", rusqlite::params![digest,owner,now])?;
+        Ok(self.compaction_owner(digest)?.as_deref() == Some(owner))
+    }
+
     /// 打开(或建库)。父目录缺失时自建——首次运行 `~/.aubridge/`
     /// 不存在,启动不该因此挂掉(engineering-constraints B-7 数据目录)。
     pub fn open(path: impl AsRef<Path>) -> rusqlite::Result<Self> {
@@ -230,13 +278,34 @@ impl Ledger {
                 PRIMARY KEY (provider, window, at)
             );",
         )?;
+        migration.execute_batch("CREATE TABLE IF NOT EXISTS compaction_owners (digest TEXT PRIMARY KEY, owner TEXT NOT NULL, created_at INTEGER NOT NULL);")?;
+        migration.execute_batch(quota::SCHEMA)?;
+        migration.execute_batch(value::SCHEMA)?;
+        let has_benchmark: bool = migration.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('usage_details') WHERE name='benchmark_json')", [], |row| row.get(0))?;
+        if !has_benchmark {
+            migration.execute(
+                "ALTER TABLE usage_details ADD COLUMN benchmark_json TEXT",
+                [],
+            )?;
+        }
         for (column, ty) in [
+            ("session_id", "TEXT"),
+            ("parent_session_id", "TEXT"),
+            ("purpose", "TEXT"),
             ("served_model", "TEXT"),
             ("input_tokens", "INTEGER"),
             ("output_tokens", "INTEGER"),
             ("skipped", "TEXT"),
             ("first_content_ms", "INTEGER"),
             ("duration_ms", "INTEGER"),
+            ("request_id", "TEXT"),
+            ("request_path", "TEXT"),
+            ("request_bytes", "INTEGER"),
+            ("cache_read_tokens", "INTEGER"),
+            ("cache_write_tokens", "INTEGER"),
+            ("input_includes_cache", "INTEGER"),
+            ("price_snapshot", "TEXT"),
+            ("benchmark_snapshot", "TEXT"),
         ] {
             let exists: bool = migration.query_row(
                 "SELECT EXISTS(SELECT 1 FROM pragma_table_info('decisions') WHERE name = ?1)",
@@ -250,6 +319,14 @@ impl Ledger {
                 )?;
             }
         }
+        migration.execute(
+            "CREATE INDEX IF NOT EXISTS idx_decisions_request_id ON decisions(request_id)",
+            [],
+        )?;
+        migration.execute(
+            "CREATE INDEX IF NOT EXISTS idx_decisions_session ON decisions(agent,session_id,ts)",
+            [],
+        )?;
         migration.commit()?;
         Ok(Self { conn })
     }
@@ -370,12 +447,14 @@ impl Ledger {
 
     /// 记一行(每请求一行,§8.3)。
     pub fn record(&self, r: &UsageRecord) -> rusqlite::Result<()> {
-        Self::insert_usage(&self.conn, r)
+        let tx = self.conn.unchecked_transaction()?;
+        Self::insert_usage(&tx, r)?;
+        tx.commit()
     }
 
     fn insert_usage(conn: &Connection, r: &UsageRecord) -> rusqlite::Result<()> {
         conn.execute(
-            "INSERT INTO usage VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            "INSERT INTO usage (ts,agent,provider,model,input_tokens,output_tokens,accounting) VALUES (?1,?2,?3,?4,?5,?6,?7)",
             rusqlite::params![
                 r.ts,
                 r.agent,
@@ -386,6 +465,30 @@ impl Ledger {
                 r.accounting.as_str()
             ],
         )?;
+        let rowid = conn.last_insert_rowid();
+        let price = r.price();
+        if price.as_ref().is_some_and(|price| {
+            !price.applies(&r.provider, &r.model) || price.basis == "user-benchmark"
+        }) {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        let price = price
+            .map(|price| serde_json::to_string(&price))
+            .transpose()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        if r.benchmark_snapshot.as_ref().is_some_and(|price| {
+            !price.applies(&r.provider, &r.model) || price.basis != "user-benchmark"
+        }) {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        let benchmark = r
+            .benchmark_snapshot
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        conn.execute("INSERT INTO usage_details(usage_rowid,request_id,cache_read_tokens,cache_write_tokens,input_includes_cache,price_json,benchmark_json)
+            VALUES(?1,?2,?3,?4,?5,?6,?7)",rusqlite::params![rowid,r.request_id,r.cache_read_tokens,r.cache_write_tokens,r.input_includes_cache,price,benchmark])?;
         Ok(())
     }
 
@@ -394,11 +497,24 @@ impl Ledger {
         let tx = self.conn.unchecked_transaction()?;
         for row in rows {
             let r = &row.decision;
+            if r.price_snapshot.as_ref().is_some_and(|price| {
+                !price.applies(&r.provider, r.served_model.as_ref().unwrap_or(&r.model))
+                    || price.basis == "user-benchmark"
+            }) {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            if r.benchmark_snapshot.as_ref().is_some_and(|price| {
+                !price.applies(&r.provider, r.served_model.as_ref().unwrap_or(&r.model))
+                    || price.basis != "user-benchmark"
+            }) {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
             tx.execute(
                 "INSERT INTO decisions
                  (ts, model, agent, provider, attempts, outcome, served_model, input_tokens,
-                  output_tokens, skipped, first_content_ms, duration_ms)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                  output_tokens, skipped, first_content_ms, duration_ms, request_id,request_path,request_bytes,
+                  cache_read_tokens,cache_write_tokens,input_includes_cache,price_snapshot,benchmark_snapshot,session_id,parent_session_id,purpose)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
                 rusqlite::params![
                     r.ts,
                     r.model,
@@ -411,7 +527,11 @@ impl Ledger {
                     r.output_tokens,
                     r.skipped,
                     r.first_content_ms,
-                    r.duration_ms
+                    r.duration_ms,
+                    r.request_id,r.request_path,r.request_bytes,r.cache_read_tokens,r.cache_write_tokens,r.input_includes_cache,
+                    r.price_snapshot.as_ref().map(serde_json::to_string).transpose().map_err(|_|rusqlite::Error::InvalidQuery)?,
+                    r.benchmark_snapshot.as_ref().map(serde_json::to_string).transpose().map_err(|_|rusqlite::Error::InvalidQuery)?,
+                    r.session_id,r.parent_session_id,r.purpose
                 ],
             )?;
             for usage in &row.usage {
@@ -428,6 +548,7 @@ impl Ledger {
         for usage in pending.iter().flat_map(|request| &request.usage) {
             Self::insert_usage(&tx, usage)?;
         }
+        tx.execute("UPDATE usage_details SET request_id=NULL", [])?;
         tx.commit()?;
         Ok(deleted + pending.len())
     }
@@ -443,6 +564,32 @@ impl Ledger {
         filter: DecisionFilter<'_>,
         limit: u32,
     ) -> rusqlite::Result<DecisionPage> {
+        self.decision_page_bounds(filter, limit, None)
+    }
+
+    pub fn decision_page_in_range(
+        &self,
+        filter: DecisionFilter<'_>,
+        limit: u32,
+        start: &str,
+        end: &str,
+        now: u64,
+    ) -> Result<DecisionPage, AnalyticsError> {
+        let window = self.analytics_window(start, end, now)?;
+        self.decision_page_bounds(
+            filter,
+            limit.min(100),
+            Some((window.start_ts, window.end_ts)),
+        )
+        .map_err(|_| AnalyticsError::Storage)
+    }
+
+    fn decision_page_bounds(
+        &self,
+        filter: DecisionFilter<'_>,
+        limit: u32,
+        bounds: Option<(u64, u64)>,
+    ) -> rusqlite::Result<DecisionPage> {
         let (before_ts, before_rowid) = match filter.before {
             Some((ts, rowid)) => (ts, Some(rowid)),
             None => (i64::MAX as u64, None),
@@ -451,13 +598,17 @@ impl Ledger {
         // breaks ties because multiple requests can start in the same second.
         let mut stmt = self.conn.prepare(
             "SELECT rowid, ts, model, agent, provider, attempts, outcome, served_model,
-                    input_tokens, output_tokens, skipped, first_content_ms, duration_ms FROM decisions
-             WHERE (?1 IS NULL OR agent = ?1)
+                    input_tokens, output_tokens, skipped, first_content_ms, duration_ms,
+                    request_id,request_path,request_bytes,cache_read_tokens,cache_write_tokens,input_includes_cache,price_snapshot,benchmark_snapshot,session_id,parent_session_id,purpose FROM decisions
+             WHERE (?12 IS NULL OR ts>=?12) AND (?13 IS NULL OR ts<?13)
+               AND (?1 IS NULL OR agent = ?1)
                AND (?2 IS NULL OR provider = ?2)
                AND (?3 IS NULL OR outcome = ?3
                     OR (?3 = 'failed' AND outcome NOT IN ('ok', 'cancelled')))
                AND ts <= ?4 AND (?5 IS NULL OR (ts, rowid) < (?4, ?5))
                AND (?8 IS NULL OR model = ?8 OR served_model = ?8)
+               AND (?10 IS NULL OR request_id = ?10)
+               AND (?11 IS NULL OR session_id = ?11)
                AND (?9 IS NULL OR provider = ?9 OR EXISTS (
                     SELECT 1 FROM json_each(CASE WHEN json_valid(attempts) THEN
                         CASE WHEN json_type(attempts) = 'array' THEN attempts END END) AS entry
@@ -488,6 +639,10 @@ impl Ledger {
                 filter.kind,
                 filter.model,
                 filter.related_provider,
+                filter.request_id,
+                filter.session_id,
+                bounds.map(|range| range.0),
+                bounds.map(|range| range.1),
             ],
             |row| {
                 Ok((
@@ -505,6 +660,17 @@ impl Ledger {
                         skipped: row.get(10)?,
                         first_content_ms: row.get(11)?,
                         duration_ms: row.get(12)?,
+                        request_id: row.get(13)?,
+                        request_path: row.get(14)?,
+                        request_bytes: row.get(15)?,
+                        cache_read_tokens: row.get(16)?,
+                        cache_write_tokens: row.get(17)?,
+                        input_includes_cache: row.get(18)?,
+                        price_snapshot: value::parse_price(row.get(19)?, 19)?,
+                        benchmark_snapshot: value::parse_price(row.get(20)?, 20)?,
+                        session_id: row.get(21)?,
+                        parent_session_id: row.get(22)?,
+                        purpose: row.get(23)?,
                     },
                 ))
             },
@@ -540,42 +706,17 @@ impl Ledger {
         month_start: u64,
         next_month: u64,
     ) -> rusqlite::Result<(f64, Vec<(String, f64)>)> {
-        let mut stmt = self.conn.prepare(
-            "SELECT provider, model, input_tokens, output_tokens FROM usage
-             WHERE ts >= ?1 AND ts < ?2",
-        )?;
-        let rows = stmt.query_map(rusqlite::params![month_start, next_month], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<u64>>(2)?,
-                row.get::<_, Option<u64>>(3)?,
-            ))
-        })?;
-        let mut total = 0.0;
-        let mut per_provider: Vec<(String, f64)> = Vec::new();
-        for row in rows {
-            let (provider, model, tin, tout) = row?;
-            let rec = UsageRecord {
-                ts: 0,
-                agent: String::new(),
-                provider: provider.clone(),
-                model,
-                input_tokens: tin,
-                output_tokens: tout,
-                accounting: Accounting::Reported,
-            };
-            if let Some(cost) = rec.benchmark_cost() {
-                total += cost;
-                if let Some(entry) = per_provider.iter_mut().find(|(p, _)| *p == provider) {
-                    entry.1 += cost;
-                } else {
-                    per_provider.push((provider, cost));
-                }
-            }
-        }
-        per_provider.sort_by(|a, b| b.1.total_cmp(&a.1));
-        Ok((total, per_provider))
+        let summary = self.value_summary(month_start, next_month)?;
+        let per = summary
+            .providers
+            .into_iter()
+            .filter_map(|provider| {
+                provider
+                    .api_equivalent_usd
+                    .map(|amount| (provider.provider, amount))
+            })
+            .collect();
+        Ok((summary.api_equivalent_usd.unwrap_or_default(), per))
     }
 
     // -------------------------------------------------------------------
@@ -704,6 +845,8 @@ impl Ledger {
                     at: row.get(2)?,
                     left: row.get(3)?,
                     resets_at: row.get(4)?,
+                    span_secs: None,
+                    legacy: true,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -772,9 +915,11 @@ mod tests {
             agent: "claude-code".into(),
             provider: "zhipu".into(),
             model: model.into(),
+            price_snapshot: PriceSnapshot::builtin(model),
             input_tokens: Some(tin),
             output_tokens: Some(tout),
             accounting: Accounting::Reported,
+            ..UsageRecord::default()
         }
     }
 
@@ -971,9 +1116,11 @@ mod tests {
                 agent: "claude-code".into(),
                 provider: "fixture".into(),
                 model: "glm-4.5-flash".into(),
+                price_snapshot: PriceSnapshot::builtin("glm-4.5-flash"),
                 input_tokens: Some(12),
                 output_tokens: Some(4),
                 accounting: Accounting::Reported,
+                ..UsageRecord::default()
             }],
         };
         ledger.record_requests(&[request(1)]).unwrap();
@@ -983,12 +1130,14 @@ mod tests {
         let pending = [request(2)];
         assert!(ledger.clear_request_history(&pending).is_err());
         assert_eq!(ledger.recent_decisions(20).unwrap()[0].ts, 1);
+        assert_eq!(ledger.value_summary(0, 10).unwrap().records, 1);
         ledger
             .conn
             .execute_batch("DROP TRIGGER fail_usage")
             .unwrap();
         assert_eq!(ledger.clear_request_history(&pending).unwrap(), 2);
         assert!(ledger.recent_decisions(20).unwrap().is_empty());
+        assert_eq!(ledger.value_summary(0, 10).unwrap().records, 2);
         assert!((ledger.monthly_savings(0, 10).unwrap().0 - 32.0 * 0.11 / 1e6).abs() < 1e-12);
     }
 
@@ -1439,7 +1588,7 @@ pub fn share_card(total: f64, per_provider: &[(String, f64)]) -> String {
         top.join(" / ")
     };
     format!(
-        "本月省了 ${total:.1} · 功臣:{heroes}(对标口径，按已报告用量，部分记录仅计入已知部分，明细可查)"
+        "本月 API 等值估算 ${total:.1} · 来源:{heroes}(对标口径，按已报告用量，部分记录仅计入已知部分，未扣订阅费，明细可查)"
     )
 }
 
@@ -1456,7 +1605,7 @@ mod share_tests {
             ("openrouter".to_string(), 0.5),
         ];
         let card = share_card(34.7, &per);
-        assert!(card.contains("本月省了 $34.7"));
+        assert!(card.contains("本月 API 等值估算 $34.7"));
         assert!(card.contains("modelscope / zhipu / kimi-plan"));
         assert!(!card.contains("openrouter"), "只取前 3");
         assert!(card.contains("对标口径"), "口径必须可见(§8.3)");
@@ -1468,6 +1617,6 @@ mod share_tests {
     fn empty_usage_card_is_honest() {
         let card = share_card(0.0, &[]);
         assert!(card.contains("暂无用量"));
-        assert!(card.contains("本月省了 $0.0"));
+        assert!(card.contains("本月 API 等值估算 $0.0"));
     }
 }

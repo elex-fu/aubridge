@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import {
   AddProviderInput,
   AgentsPage,
@@ -16,10 +16,15 @@ import {
   fetchJson,
   postJson,
   reportOpenCodeSync,
+  readableActionError,
   supportsWiring,
 } from "./api";
 import { fmtRouteReason, fmtTime, fmtUtil } from "./format";
 import { Dialog } from "./Dialog";
+import { TaskView } from "./TaskView";
+import { ModelDirectory, ModelFactsText } from "./ModelDirectory";
+import { CostIntentPanel } from "./CostIntent";
+import { SourceHealthFacts } from "./SourceHealthFacts";
 
 const CATALOG_ISSUES = {
   network: "无法连接到目录",
@@ -50,7 +55,7 @@ function QuotaCurve({ provider, setErr }: { provider: string; setErr: (s: string
   return (
     <div className="quota-curves">
       {data.map(item => (
-        <QuotaWindowLine key={item.window} item={item} />
+        <QuotaWindowLine key={`${item.window}:${item.legacy ?? false}`} item={item} />
       ))}
     </div>
   );
@@ -81,6 +86,7 @@ function QuotaWindowLine({ item }: { item: QuotaHistoryItem }) {
       <figcaption className="muted">
         {item.window === "5h" ? "5 小时窗口" : item.window === "7d" ? "7 天窗口" : item.window}
         {" · 剩余百分比(虚线 = 均匀消耗参考)"}
+        {item.legacy && " · 未区分登录身份的旧记录"}
       </figcaption>
       <svg
         viewBox={`0 0 ${W} ${H}`}
@@ -104,6 +110,34 @@ function QuotaWindowLine({ item }: { item: QuotaHistoryItem }) {
   );
 }
 
+function QuotaStatus({ quota }: { quota: ProviderSourceRow["quota"] }) {
+  if (!quota) return null;
+  const issues = {
+    authentication: "额度接口拒绝了当前登录或 Key",
+    "rate-limited": "额度查询暂时被限速",
+    network: "暂时无法连接额度服务",
+    timeout: "额度查询超时",
+    upstream: "额度服务返回错误",
+    "invalid-response": "额度服务返回了无法识别的读数",
+    unsupported: "当前来源未提供可查询的套餐窗口",
+  };
+  return <div className="quota-status">
+    <p className="muted">
+      最近有效读数：{quota.observed_at == null ? "尚无" : fmtTime(quota.observed_at)}
+      {" · 最近查询："}{quota.checked_at == null ? "尚未查询" : fmtTime(quota.checked_at)}
+      {quota.observed_at != null && quota.stale && " · 读数已过期，暂不用于额度排序"}
+    </p>
+    {quota.issue && <p className="muted">{issues[quota.issue] ?? "额度暂不可查询"}；保留上次有效读数。</p>}
+    {quota.history_unavailable && <p className="error">额度已更新，本机历史暂不可写，将自动重试。</p>}
+    {(quota.windows ?? []).map(window => <p key={window.id}>
+      {window.id} 窗口 · 已用 {window.used_percent.toFixed(1)}%
+      {" · "}{window.resets_at == null ? "重置时间未知" : `${fmtTime(window.resets_at)} 重置`}
+      {" · "}{window.source === "api" ? "官方额度接口" : "推理响应头"}
+      {window.stale && " · 读数已过期"}
+    </p>)}
+  </div>;
+}
+
 function RoutingStatus({ provider }: { provider: ProviderSourceRow }) {
   if (provider.kind !== "subscription" || !Array.isArray(provider.routing_status)) return null;
   const entries = provider.routing_status.filter(entry => entry != null && typeof entry === "object" &&
@@ -112,8 +146,8 @@ function RoutingStatus({ provider }: { provider: ProviderSourceRow }) {
   const blocked = entries.filter(entry => entry.status !== "eligible").length;
 
   return (
-    <details className="section-details" aria-label={`${provider.id} 的路由状态`}>
-      <summary>路由状态 · {blocked ? `有模型暂不可用 ${blocked}/${entries.length}` : "当前无路由阻塞"}</summary>
+    <section aria-label={`${provider.id} 的路由状态`}>
+      <p>路由状态 · {blocked ? `有模型暂不可用 ${blocked}/${entries.length}` : "当前无路由阻塞"}</p>
       <ul aria-label={`${provider.id} 的逐模型路由状态`}>
         {entries.map((entry, index) => {
           const reason = fmtRouteReason(entry.status);
@@ -131,16 +165,17 @@ function RoutingStatus({ provider }: { provider: ProviderSourceRow }) {
         })}
       </ul>
       <p className="muted">此为当前路由状态快照，重试时刻不保证恢复。不含请求工具能力、分组筛选、网关开关或实时检测结果。</p>
-    </details>
+    </section>
   );
 }
 
 // key 设置行内表单:粘贴 → 保存只回布尔回执(key 值永不回显,红线);
 // 保存即生效,网关凭据缓存即时失效,无需重启(ui-design §6.2)。
-function KeyForm({ p, onDone, setErr }: { p: ProviderSourceRow; onDone: () => void; setErr: (s: string) => void }) {
+function KeyForm({ p, onDone, setErr, onBusyChange }: { p: ProviderSourceRow; onDone: () => void; setErr: (s: string) => void; onBusyChange: (id: string, busy: boolean) => void }) {
   const [key, setKey] = useState("");
   const [saving, setSaving] = useState(false);
   const [confirmClear, setConfirmClear] = useState(false);
+  useEffect(()=>{onBusyChange(p.id,saving||confirmClear);},[p.id,saving,confirmClear,onBusyChange]);
 
   const save = async () => {
     if (!key) return;
@@ -218,7 +253,7 @@ async function clearKey(id: string, onDone: () => void, setErr: (s: string) => v
 }
 
 // 添加 Provider(cc-switch 式卡片流,字段固定,无自由 JSON 编辑器)。
-function AddForm({ onDone, onFailed, setErr }: { onDone: () => void; onFailed: () => void; setErr: (s: string) => void }) {
+function AddForm({ onDone, onFailed, setErr, onBusyChange }: { onDone: () => void; onFailed: () => void; setErr: (s: string) => void; onBusyChange: (busy:boolean)=>void }) {
   const [id, setId] = useState("");
   const [kind, setKind] = useState<AddProviderInput["kind"] | "">("");
   const [base, setBase] = useState("");
@@ -227,6 +262,7 @@ function AddForm({ onDone, onFailed, setErr }: { onDone: () => void; onFailed: (
   const [key, setKey] = useState("");
   const [saving, setSaving] = useState(false);
 
+  useEffect(()=>{onBusyChange(saving);},[saving,onBusyChange]);
   const save = async () => {
     if (!kind || saving) return;
     const body: AddProviderInput = {
@@ -265,14 +301,14 @@ function AddForm({ onDone, onFailed, setErr }: { onDone: () => void; onFailed: (
         <label className="field">上游地址
           <input type="url" value={base} disabled={saving} onChange={e => setBase(e.target.value)} placeholder="https://api.example.dev/v1" />
         </label>
-        <label className="field">来源类别
+        <label className="field">来源类别（你的声明）
           <select aria-label="来源类别" value={kind} disabled={saving} onChange={e => {
             const value = e.target.value;
             setKind(value === "free_tier" || value === "subscription" ? value : "");
           }}>
             <option value="">请选择来源类别</option>
-            <option value="free_tier">官方免费档</option>
-            <option value="subscription">自有订阅（Coding Plan等）</option>
+            <option value="free_tier">官方免费档（自行声明）</option>
+            <option value="subscription">自有订阅（自行声明）</option>
           </select>
         </label>
         <label className="field">上游协议
@@ -282,7 +318,7 @@ function AddForm({ onDone, onFailed, setErr }: { onDone: () => void; onFailed: (
           </select>
         </label>
       </div>
-      <p className="muted">免费档可用于仅免费档分组；自有订阅作为订阅源参与路由。</p>
+      <p className="muted">类别只记录你的声明，不证明免费，也不会自动授权使用订阅。实际可用仍取决于已许可的费用范围、当前模型费用依据及其他可用条件。</p>
       <label className="field">模型 ID
         <input value={models} disabled={saving} onChange={e => setModels(e.target.value)}
           placeholder="逗号分隔，如 glm-4.5-flash, glm-4.6v-flash" />
@@ -483,12 +519,13 @@ function ProviderEditor({ provider, onClose, onSaved }: {
           />
         </label>
         <p className="muted" id="provider-editor-base-hint">只可修改路径，地址须使用相同的协议、主机和端口。</p>
-        <label className="field">类别
+        <label className="field">来源类别（你的声明）
           <select value={kind} onChange={e => setKind(e.target.value)} disabled={saving}>
-            <option value="free_tier">免费档</option>
-            <option value="subscription">订阅</option>
+            <option value="free_tier">官方免费档（自行声明）</option>
+            <option value="subscription">自有订阅（自行声明）</option>
           </select>
         </label>
+        <p className="muted">类别只记录你的声明，不证明免费，也不会自动授权使用订阅。实际可用仍取决于已许可的费用范围、当前模型费用依据及其他可用条件。</p>
         <label className="field">模型 ID，按行或逗号分隔
           <textarea rows={5} value={text} onChange={e => setText(e.target.value)} autoFocus disabled={saving} />
         </label>
@@ -536,14 +573,51 @@ function ProviderEditor({ provider, onClose, onSaved }: {
 // Provider 页(ui-design §6.2):行主体 = 名称/类别/模型/key 布尔/
 // 服务 agent 数;[+ 添加 Provider] 卡片流;底部"可反代的 Agents"
 // 只读区(设置页已独立为最右页签,2026-11-06 用户拍板)。
-export function Providers({ setErr }: { setErr: (s: string) => void }) {
+function OpenRouterCachedModels({setErr,snapshot}:{setErr:(error:string)=>void;snapshot?:OpenRouterCatalog|null}) {
+  const [cache,setCache]=useState<import("./api").ModelDirectory|null>(null);
+  const [readFailure,setReadFailure]=useState(false);
+  const [reading,setReading]=useState(true);
+  const [readAttempt,setReadAttempt]=useState(0);
+  useEffect(()=>{
+    const request=new AbortController();
+    setReading(true);setReadFailure(false);
+    fetchJson<import("./api").ModelDirectory>("/admin/providers/openrouter/catalog",{signal:request.signal})
+      .then(value=>{if(!request.signal.aborted)setCache(value);})
+      .catch(error=>{if(!request.signal.aborted){setReadFailure(true);setErr(`读取OpenRouter缓存目录失败：${error}`);}})
+      .finally(()=>{if(!request.signal.aborted)setReading(false);});
+    return()=>request.abort();
+  },[readAttempt]);
+  const currentSnapshot=snapshot && snapshot.fetched_at!==null && snapshot.fetched_at>=(cache?.fetched_at??0) ? snapshot : null;
+  const readStatus=readFailure ? <p className="error" role="alert">缓存目录读取失败，当前状态未确认。<button disabled={reading} onClick={()=>setReadAttempt(current=>current+1)}>重试只读缓存</button></p> : null;
+  if(currentSnapshot)return <>
+    {readStatus}
+    <p>获取于 {fmtTime(currentSnapshot.fetched_at!)}{currentSnapshot.stale ? " · 已过期" : ""}{currentSnapshot.issue ? " · 最近读取失败，保留上次结果" : ""}</p>
+    <ul className="catalog-list">{currentSnapshot.models.map(model=><li key={model.id}>{model.id} · {model.tools?"支持工具":"工具能力未确认"}{model.context ? ` · ${model.context.toLocaleString()} token 上下文` : ""}</li>)}</ul>
+    {!currentSnapshot.models.length && <p>缓存中暂无模型。</p>}
+  </>;
+  return <>{readStatus}{!cache ? !readFailure && <p role="status">正在读取缓存目录…</p> : <>
+    <p>{cache.fetched_at ? `获取于 ${fmtTime(cache.fetched_at)}` : "尚无完整目录"}{cache.stale ? " · 已过期" : ""}{cache.issue ? " · 最近读取失败，保留上次结果" : ""}</p>
+    <ul className="catalog-list">{cache.models.map(model=><li key={model.id}>{model.id}<ModelFactsText facts={model.facts} /></li>)}</ul>
+    {!cache.models.length && <p>缓存中暂无模型。</p>}
+  </>}</>;
+}
+
+export function Providers({ setErr, onReturn, returnLabel, onBusyChange }: {
+  setErr: (s: string) => void; onReturn?: () => void; returnLabel?: string; onBusyChange?: (busy: boolean) => void;
+}) {
   const [data, setData] = useState<ProvidersPage | null>(null);
   const [agents, setAgents] = useState<AgentsPage | null>(null);
   const [loadFailed, setLoadFailed] = useState(false);
   const [agentsFailed, setAgentsFailed] = useState(false);
   const [adding, setAdding] = useState(false);
+  const [addVisited,setAddVisited]=useState(false);
+  const [addBusy,setAddBusy]=useState(false);
+  const [costBusy, setCostBusy] = useState(false);
+  const returnTrigger = useRef<HTMLButtonElement>(null);
+  const taskTrigger=useRef<HTMLButtonElement|null>(null);
   const [checks, setChecks] = useState<Record<string, ProviderCheck | "checking">>({});
   const checkRequests = useRef(new Map<string, symbol>());
+  const providerConnections=useRef(new Map<string,string>());
   const [checkModels, setCheckModels] = useState<Record<string, string>>({});
   const [refreshing, setRefreshing] = useState(false);
   const [routingPending, setRoutingPending] = useState(false);
@@ -551,10 +625,38 @@ export function Providers({ setErr }: { setErr: (s: string) => void }) {
   const [deleteProvider, setDeleteProvider] = useState<ProviderSourceRow | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [ccImporting, setCcImporting] = useState(false);
-  // 展开过即拉一次窗口历史(曲线懒挂载)。
-  const [quotaExpanded, setQuotaExpanded] = useState<Record<string, boolean>>({});
+  // 首次进入额度任务才读取历史，返回保留同一组件。
+  const [quotaVisited, setQuotaVisited] = useState<Record<string, boolean>>({});
+  const [directoryVisited, setDirectoryVisited] = useState<Record<string, boolean>>({});
+  const [managed, setManaged] = useState<Record<string, boolean>>({});
+  const [activeProvider, setActiveProvider] = useState<string | null>(null);
+  const [purpose, setPurpose] = useState("manage");
+  const [catalogVisible, setCatalogVisible] = useState(false);
+  const [catalogVisited, setCatalogVisited] = useState(false);
+  const [providerBusy,setProviderBusy]=useState<Record<string,boolean>>({});
+  const [directoryBusy,setDirectoryBusy]=useState<Record<string,boolean>>({});
+  const keyActivity=useCallback((id:string,busy:boolean)=>setProviderBusy(current=>current[id]===busy?current:{...current,[id]:busy}),[]);
+  const directoryActivity=useCallback((id:string,busy:boolean)=>setDirectoryBusy(current=>current[id]===busy?current:{...current,[id]:busy}),[]);
 
-  const loadProviders = () => fetchJson<ProvidersPage>("/admin/providers").then(value => { setData(value); setLoadFailed(false); });
+  const providerRevision = useRef(0);
+  const loadProviders = () => {
+    const revision = ++providerRevision.current;
+    return fetchJson<ProvidersPage>(onReturn ? "/admin/providers?sample=0" : "/admin/providers").then(value => {
+      if (revision !== providerRevision.current) return;
+      const changed:string[]=[];
+      for(const provider of value.providers??[]) {
+        const identity=provider.source_health?.cost.connection_identity??provider.base;
+        const previous=providerConnections.current.get(provider.id);
+        if(previous!==undefined && previous!==identity) {changed.push(provider.id);checkRequests.current.delete(provider.id);}
+        providerConnections.current.set(provider.id,identity);
+      }
+      if(changed.length)setChecks(current=>Object.fromEntries(Object.entries(current).filter(([id])=>!changed.includes(id))));
+      setData(value);
+      setLoadFailed(false);
+    }).catch(error => {
+      if (revision === providerRevision.current) throw error;
+    });
+  };
   const load = () => {
     loadProviders().catch(e => { setLoadFailed(true); setErr(String(e)); });
     fetchJson<AgentsPage>("/admin/agents")
@@ -563,11 +665,31 @@ export function Providers({ setErr }: { setErr: (s: string) => void }) {
   };
   useEffect(load, [setErr]);
   useEffect(() => {
+    if (onReturn) return;
+    const timer = window.setInterval(() => {
+      loadProviders().catch(error => { setLoadFailed(true); setErr(String(error)); });
+    }, 30_000);
+    return () => { window.clearInterval(timer); providerRevision.current += 1; };
+  }, [setErr, Boolean(onReturn)]);
+  useEffect(() => {
     const requests = checkRequests.current;
     return () => requests.clear();
   }, []);
 
-  if (!data) return <p className="status-loading" role="status">{loadFailed ? "模型源暂不可读取。" : "正在读取模型源…"}{loadFailed && <button className="ghost" onClick={load}>重试</button>}</p>;
+  useEffect(()=>{
+    if(data && activeProvider && !data.providers?.some(provider=>provider.id===activeProvider))setActiveProvider(null);
+  },[data,activeProvider]);
+
+  const navigationLocked = costBusy || addBusy || refreshing || routingPending || deleting || Boolean(ccImporting || deleteProvider || editingProvider) || Object.values(providerBusy).some(Boolean) || Object.values(directoryBusy).some(Boolean) || Object.values(checks).some(value => value === "checking");
+  useEffect(() => { onBusyChange?.(navigationLocked); return () => onBusyChange?.(false); }, [navigationLocked, onBusyChange]);
+  const hasReturn = Boolean(onReturn);
+  const hasData = Boolean(data);
+  useEffect(() => { if (hasReturn) returnTrigger.current?.focus(); }, [hasReturn, hasData]);
+  const returnControl = onReturn && <div className="guide setup-guide">
+    <p>这里只处理模型来源与费用前提。返回后会重新读取原工具条件，不会自动保存或运行任务。</p>
+    <button ref={returnTrigger} disabled={navigationLocked} onClick={() => { if (!navigationLocked) onReturn(); }}>{returnLabel || "返回原工具任务"}</button>
+  </div>;
+  if (!data) return <>{returnControl}<p className="status-loading" role="status">{loadFailed ? "模型源暂不可读取。" : "正在读取模型源…"}{loadFailed && <button className="ghost" onClick={load}>重试</button>}</p></>;
 
   const rows = data.providers || [];
   const directory = data.openrouter_catalog;
@@ -591,6 +713,7 @@ export function Providers({ setErr }: { setErr: (s: string) => void }) {
       invalidateCheck(p.id);
       reportOpenCodeSync(receipt, setErr);
       setDeleteProvider(null);
+      setActiveProvider(current=>current===p.id?null:current);
       load();
     } catch (e) {
       setErr(`删除 ${p.id} 失败:${e}`);
@@ -614,7 +737,7 @@ export function Providers({ setErr }: { setErr: (s: string) => void }) {
     } catch (e) {
       if (checkRequests.current.get(p.id) !== request) return;
       invalidateCheck(p.id);
-      setErr(`检测 ${p.id} 失败 · ${e}`);
+      setErr(`检测 ${p.id} 失败 · ${readableActionError(e)}`);
     }
   };
 
@@ -623,7 +746,7 @@ export function Providers({ setErr }: { setErr: (s: string) => void }) {
     try {
       const body = action === "pause" ? { paused: !p.paused } : {};
       await postJson(`/admin/providers/${encodeURIComponent(p.id)}/${action}`, body);
-      setData(await fetchJson<ProvidersPage>("/admin/providers"));
+      await loadProviders();
     } catch (e) {
       setErr(`更新 ${p.id} 的路由状态失败 · ${e}`);
     } finally {
@@ -647,52 +770,39 @@ export function Providers({ setErr }: { setErr: (s: string) => void }) {
 
   return (
     <div className="providers-page management-page">
+      {returnControl}
+      <div className="task-workspace-pane" hidden={activeProvider!==null || catalogVisible || adding}>
       <div className="page-heading">
         <div>
           <h2 className="page-title">模型源</h2>
-          <p className="page-description">官方免费档优先，自有订阅兜底</p>
+          <p className="page-description">明确费用范围后，按来源事实管理模型与凭据</p>
         </div>
         <span className="actions">
           <button className="ghost" onClick={() => setCcImporting(true)}>从 cc-switch 导入</button>
-          <button className={adding ? "button-secondary" : "button-primary"} onClick={() => setAdding(!adding)}>
-            {adding ? "取消添加" : "添加模型源"}
+          <button className="button-primary" onClick={event=>{taskTrigger.current=event.currentTarget;setAddVisited(true);setAdding(true);}}>
+            添加模型源
           </button>
         </span>
       </div>
-      {adding && <section className="panel">
-        <div className="panel-header"><h3>添加模型源</h3></div>
-        <AddForm
-          onDone={() => { setAdding(false); load(); }}
-          onFailed={() => {
-            // 读取失败时保留原新增错误。
-            void loadProviders().catch(() => {});
-          }}
-          setErr={setErr}
-        />
-      </section>}
+      <CostIntentPanel providers={rows} onSaved={load} onBusyChange={setCostBusy} />
       <div className="data-list" aria-label="模型源列表">
         {rows.map(p => {
           const result = checks[p.id];
           const models = p.models ?? [];
           const checkModel = models.find(model => model === checkModels[p.id]) ?? models[0];
           return (
-            <details
-              className="data-row provider-row"
-              key={p.id}
-              onToggle={e => {
-                if (!(e.target as HTMLDetailsElement).open) return;
-                setQuotaExpanded(current =>
-                  current[p.id] ? current : { ...current, [p.id]: true },
-                );
-              }}
-            >
-              <summary className="provider-summary">
+            <div className="data-row provider-row" key={p.id}>
+              <div className="provider-summary">
                 <span className="row-main">
                   <span className="row-title">
                     <strong>{p.id}</strong>
-                    <span className={`badge ${p.kind === "subscription" ? "subscription" : "off"}`}>{p.kind === "subscription" ? "自有订阅" : p.kind === "free_tier" ? "免费档" : "类别未知"}</span>
+                    <span className={`badge ${p.kind === "subscription" ? "subscription" : "off"}`}>{p.kind === "subscription" ? p.source === "custom" ? "声明订阅" : "自有订阅" : p.kind === "free_tier" ? p.source === "custom" ? "声明免费档" : "免费档" : "类别未知"}</span>
                     {p.source === "custom" && <span className="badge off">自定义</span>}
-                    {p.store_key && p.key_source === "saved" ? (
+                    {p.id === "claude-cli" && p.paused ? (
+                      <span className="badge off">来源未启用</span>
+                    ) : p.source_health?.credential.required === false ? (
+                      <span className="badge off">无需凭据</span>
+                    ) : p.store_key && p.key_source === "saved" ? (
                       <span className="badge success">已保存 Key</span>
                     ) : p.store_key && p.key_source === "environment" ? (
                       <span className="badge success">环境变量 Key</span>
@@ -709,25 +819,66 @@ export function Providers({ setErr }: { setErr: (s: string) => void }) {
                   <span className="row-meta">
                     {models.length} 个模型
                     {(p.util_5h != null || p.util_7d != null) && (
-                      <span title="5 小时 / 7 天窗口已用百分比（被动采样与主动查询合并）">
-                        用量 {fmtUtil(p)}
-                        {p.resets_at != null && ` · ${fmtTime(p.resets_at)} 重置`}
+                      <span title="各窗口已用百分比；在额度历史查看重置时间与读数来源">
+                        用量 {p.quota?.windows?.length ? p.quota.windows.map(window => `${window.id} ${window.used_percent.toFixed(0)}%${window.stale ? "（旧）" : ""}`).join(" / ") : fmtUtil(p)}
+                        {!p.quota?.windows?.length && p.resets_at != null && ` · ${fmtTime(p.resets_at)} 重置`}
                       </span>
                     )}
+                    {p.id === "claude-cli" && <span>本机官方 Claude CLI · 待实机验证 · 套餐与额度未知</span>}
                     {p.id === "chatgpt" && <span>登录来源：{p.login_source === "codex" ? "Codex" : p.login_source === "opencode" ? "OpenCode" : "未知"}</span>}
                     {p.paused && <span className="badge warn">推理已暂停</span>}
+                    {p.quota?.issue && <span className="badge warn">额度查询暂不可用</span>}
+                    {p.free_requests?.some(entry=>entry.status!=="eligible") && <span className="badge warn">免费请求受限 · {fmtRouteReason(p.free_requests.find(entry=>entry.status!=="eligible")!.status)}</span>}
                     {p.routing_disabled && <span className="badge bad">因上游限制已停用</span>}
                     {Array.isArray(p.routing_status) && p.routing_status.some(entry => entry && typeof entry.status === "string" && entry.status !== "eligible") && <span className="badge warn">有模型暂不可用</span>}
                     {result && result !== "checking" && result.model === checkModel && <span>最近检测：{fmtRouteReason(result.status)}</span>}
                   </span>
                 </span>
-                <span className="row-actions"><span className="detail-label">管理</span></span>
-              </summary>
+                <span className="row-actions"><button onClick={event => {taskTrigger.current=event.currentTarget;setManaged(current=>({...current,[p.id]:true}));setActiveProvider(p.id);setPurpose("manage");}}>管理</button></span>
+              </div>
+            </div>
+          );
+        })}
+        {!rows.length && <div className="empty-state">
+          <p>还没有模型源，请先准备你有权使用的外部来源。</p>
+          <p>已有受支持的 ChatGPT 登录：到“设置 → 登录与连接”核对 Codex 或 OpenCode 登录来源。</p>
+          <p>已有 API Key：添加模型源，填写厂商提供的地址、协议与模型。</p>
+          <p>两者都没有：先向厂商准备可用账户或 Key；本应用不附送账号或额度。</p>
+          <p>准备后仍需可运行的工具、符合条件的模型和明确的费用许可；添加来源不代表已可调用。</p>
+        </div>}
+      </div>
+      </div>
+      {addVisited && <div className="task-workspace-pane" hidden={!adding}><TaskView title="添加模型源" busy={addBusy} onBack={()=>{setAdding(false);window.requestAnimationFrame(()=>taskTrigger.current?.focus());}}>
+        <AddForm onBusyChange={setAddBusy}
+          onDone={() => { setAdding(false);setAddVisited(false);setAddBusy(false); load(); }}
+          onFailed={() => {
+            // 读取失败时保留原新增错误。
+            void loadProviders().catch(() => {});
+          }}
+          setErr={setErr}
+        />
+      </TaskView></div>}
+      {rows.map(p => {
+        if(!managed[p.id])return null;
+        const result=checks[p.id];
+        const models=p.models??[];
+        const checkModel=models.find(model=>model===checkModels[p.id])??models[0];
+        return <div className="task-workspace-pane" hidden={activeProvider!==p.id}
+        key={`${p.id}:${p.source_health?.cost.connection_identity ?? p.base}`}>
+        <TaskView title={`管理模型源 · ${p.id}`} onBack={() => {setActiveProvider(null);window.requestAnimationFrame(()=>taskTrigger.current?.focus());}}
+          busy={routingPending || checks[p.id]==="checking" || deleting || providerBusy[p.id] || directoryBusy[p.id]}>
+          <nav className="task-workspace-nav" aria-label={`${p.id} 的管理用途`}>
+            {[["manage","连接与凭据"],["quota","额度历史"],["directory","厂商目录"],["routing","模型与路由"],["free","免费请求状态"]].filter(([id])=>id!=="free" || !!p.free_requests?.length).map(([id,label])=><button key={id} aria-pressed={purpose===id}
+              disabled={routingPending || checks[p.id]==="checking" || deleting || providerBusy[p.id] || directoryBusy[p.id]}
+              onClick={()=>{setPurpose(id);if(id==="quota")setQuotaVisited(current=>({...current,[p.id]:true}));if(id==="directory")setDirectoryVisited(current=>({...current,[p.id]:true}));}}>{label}</button>)}
+          </nav>
+          <div className="task-workspace-pane" hidden={purpose!=="manage"}>
               <div className="detail-panel provider-sections">
+                <SourceHealthFacts provider={p} />
                 <section>
                   <h3 className="section-label">凭据</h3>
-                  {p.store_key ? <KeyForm p={p} onDone={() => { invalidateCheck(p.id); load(); }} setErr={setErr} />
-                    : <p className="muted">{p.ready ? "登录凭据已就绪。" : "登录凭据尚未就绪。"}</p>}
+                  {p.store_key ? <KeyForm p={p} onBusyChange={keyActivity} onDone={() => { invalidateCheck(p.id); load(); }} setErr={setErr} />
+                    : <p className="muted">{p.id === "claude-cli" && p.paused ? "来源未启用，启用后读取本机官方 CLI 登录；真实验收待完成。" : p.ready ? "登录凭据已就绪。" : "登录凭据尚未就绪。"}</p>}
                   {p.id === "chatgpt" && <p className="muted">
                     {p.login_source === "opencode" ? "只读取 OpenCode 的当前登录，自动更新仅保存在本应用内。" : p.login_source === "codex" ? "跟随 Codex 的当前登录。" : "登录来源未知，请在设置中确认。"}
                     {" "}可在设置中更改登录来源，不会自动切换到其他来源。
@@ -745,43 +896,19 @@ export function Providers({ setErr }: { setErr: (s: string) => void }) {
                         {models.map(model => <option key={model} value={model}>{model}</option>)}
                       </select>
                     </label>}
-                    <button disabled={!p.ready || !checkModel || result === "checking"} onClick={() => check(p, checkModel)}>
+                    <button disabled={!(p.ready || p.source_health?.credential.required === false && p.source_health.credential.usable) || !checkModel || result === "checking"} onClick={() => check(p, checkModel)}>
                       {result === "checking" ? "检测中…" : "检测连接"}
                     </button>
                   </div>
-                  <p className="muted">向选中模型发送一条短请求，可能占用少量上游额度。</p>
+                  <p className="muted">向选中模型发送一条短请求，可能使用额度或产生费用。此显式检测独立于自动推理的费用范围，不会修改费用选择。</p>
                   {result && result !== "checking" && result.model === checkModel && <p role="status">
                     {fmtRouteReason(result.status)}
                     {result.model && ` · ${result.model}`}
                     {result.upstream_status != null && ` · HTTP ${result.upstream_status}`}
                   </p>}
                 </section>
-                <section>
-                  <h3 className="section-label">额度</h3>
-                  {(p.util_5h != null || p.util_7d != null) ? (
-                    <p className="muted">
-                      5 小时 / 7 天窗口已用:{fmtUtil(p)}
-                      {p.resets_at != null && ` · ${fmtTime(p.resets_at)} 重置`}
-                    </p>
-                  ) : (
-                    <p className="muted">尚无窗口读数（被动采样与主动查询都会补上）。</p>
-                  )}
-                  {quotaExpanded[p.id] && <QuotaCurve provider={p.id} setErr={setErr} />}
-                </section>
-                <section>
-                  <h3 className="section-label">模型与路由</h3>
-                  {models.length ? <ul className="model-list">{models.map(model => <li key={model}>{model}</li>)}</ul> : <p className="muted">此源没有模型。</p>}
-                  <RoutingStatus provider={p} />
-                  {!!p.free_requests?.length && <details className="section-details">
-                    <summary>免费请求状态</summary>
-                    <ul>{p.free_requests.map(entry => <li key={entry.model}>
-                      {entry.model} · {fmtRouteReason(entry.status)}
-                      {entry.retry_at ? ` · ${fmtTime(entry.retry_at)} 可重试` : ""}
-                    </li>)}</ul>
-                  </details>}
-                </section>
                 <div className="actions">
-                  <button disabled={routingPending} onClick={() => updateRouting(p, "pause")}>{p.paused ? "恢复推理" : "暂停推理"}</button>
+                  <button disabled={routingPending} onClick={() => updateRouting(p, "pause")}>{p.id === "claude-cli" ? p.paused ? "启用 Claude CLI（待实机验证）" : "停用" : p.paused ? "恢复推理" : "暂停推理"}</button>
                   {p.routing_disabled && <button disabled={routingPending} onClick={() => updateRouting(p, "resume-routing")}
                     title="确认上游限制已解除后，允许该源再次参与路由">重新允许路由</button>}
                   {p.source === "custom" && <>
@@ -790,12 +917,36 @@ export function Providers({ setErr }: { setErr: (s: string) => void }) {
                   </>}
                 </div>
               </div>
-            </details>
-          );
-        })}
-        {!rows.length && <p className="empty-state">还没有模型源，添加一个即可开始。</p>}
-      </div>
-      {(directory || rows.some(p => p.id === "openrouter")) && <section className="panel">
+          </div>
+          <div className="task-workspace-pane" hidden={purpose!=="quota"}>
+                  {(p.util_5h != null || p.util_7d != null) ? (
+                    <p className="muted">
+                      5 小时 / 7 天窗口已用:{fmtUtil(p)}
+                      {p.resets_at != null && ` · ${fmtTime(p.resets_at)} 重置`}
+                    </p>
+                  ) : (
+                    <p className="muted">尚无窗口读数（被动采样与主动查询都会补上）。</p>
+                  )}
+                  <QuotaStatus quota={p.quota} />
+                  {quotaVisited[p.id] && <QuotaCurve key={`${p.id}:${p.quota?.revision ?? 0}`} provider={p.id} setErr={setErr} />}
+
+          </div>
+          <div className="task-workspace-pane" hidden={purpose!=="directory"}>
+            {directoryVisited[p.id] && <ModelDirectory provider={p} onDone={loadProviders} setErr={setErr} onBusyChange={directoryActivity} />}
+          </div>
+          <div className="task-workspace-pane" hidden={purpose!=="routing"}>
+            {models.length ? <ul className="model-list">{models.map(model=><li key={model}>{model}
+              {p.model_availability?.[model]===false && <strong className="error"> · 厂商当前目录未列出</strong>}
+              <ModelFactsText facts={p.model_facts?.[model]} /></li>)}</ul> : <p>此源没有模型。</p>}
+            <RoutingStatus provider={p} />
+          </div>
+          <div className="task-workspace-pane" hidden={purpose!=="free"}>
+            {!p.free_requests?.length && <p>当前没有免费请求状态记录。</p>}
+            <ul>{p.free_requests?.map(entry=><li key={entry.model}>{entry.model} · {fmtRouteReason(entry.status)}{entry.retry_at ? ` · ${fmtTime(entry.retry_at)} 可重试` : ""}</li>)}</ul>
+          </div>
+        </TaskView>
+      </div>;})}
+      {(directory || rows.some(p => p.id === "openrouter")) && <section className="panel" hidden={activeProvider!==null || catalogVisible || adding}>
         <div className="panel-header">
           <h3>OpenRouter 免费模型</h3>
           <button disabled={refreshing} onClick={refreshDirectory}>{refreshing ? "刷新中…" : "刷新目录"}</button>
@@ -808,19 +959,17 @@ export function Providers({ setErr }: { setErr: (s: string) => void }) {
             {directory.stale && " · 沿用上次有效目录"}
             {directory.issue && ` · ${CATALOG_ISSUES[directory.issue]}`}
           </p>
-          {!!directory.models.length && <details className="section-details">
-            <summary>{directory.models.length} 个免费文本模型</summary>
-            <ul className="catalog-list">{directory.models.map(model => <li key={model.id}>
-              {model.id} · {model.tools ? "支持工具" : "未声明支持工具"}
-              {model.context && ` · ${model.context.toLocaleString()} token 上下文`}
-            </li>)}</ul>
-          </details>}
+          {!!directory.models.length && <button onClick={event=>{taskTrigger.current=event.currentTarget;setCatalogVisited(true);setCatalogVisible(true);}}>浏览 {directory.models.length} 个缓存模型</button>}
           </> : <p className="muted">目录状态未知。</p>}
           {rows.some(p => p.id === "openrouter") && <p className="muted">Key 预算（USD） · {data.openrouter_key_budget
             ? data.openrouter_key_budget.limit == null ? "未设上限" : `剩余 ${data.openrouter_key_budget.limit_remaining ?? "未知"} / ${data.openrouter_key_budget.limit}`
             : "未知"}</p>}
         </div>
       </section>}
+      {catalogVisited && <div className="task-workspace-pane" hidden={!catalogVisible}><TaskView title="OpenRouter 缓存目录" onBack={()=>{setCatalogVisible(false);window.requestAnimationFrame(()=>taskTrigger.current?.focus());}} busy={refreshing}>
+        <p className="muted">仅浏览本地已缓存目录。刷新厂商目录需要返回后明确点击刷新。</p>
+        <OpenRouterCachedModels setErr={setErr} snapshot={directory} />
+      </TaskView></div>}
       {ccImporting && <CcSwitchImportDialog
         onClose={() => setCcImporting(false)}
         onImported={load}
@@ -841,7 +990,7 @@ export function Providers({ setErr }: { setErr: (s: string) => void }) {
         load();
       }} />}
 
-      <section className="panel">
+      <section className="panel" hidden={activeProvider!==null || catalogVisible || adding}>
       <div className="panel-header"><h3>已检测的 Agents</h3></div>
       <p className="panel-body muted">
         {agentsFailed ? "Agent 配置暂不可读取。" : !agents ? "正在读取 Agent 配置…" : detected.length
@@ -851,4 +1000,45 @@ export function Providers({ setErr }: { setErr: (s: string) => void }) {
       </section>
     </div>
   );
+}
+
+// Explicit request inspection: current local snapshot only, never the sampled source page.
+export function SourceInspection({ providerId, onBack, requestFacts }: {
+  providerId: string; onBack: () => void; requestFacts?: ReactNode;
+}) {
+  const [provider, setProvider] = useState<ProviderSourceRow | null>(null);
+  const [state, setState] = useState<"reading" | "ready" | "missing" | "failed">("reading");
+  const [revision, setRevision] = useState(0);
+  const [readProviderId, setReadProviderId] = useState<string | null>(null);
+  useEffect(() => {
+    const controller = new AbortController();
+    setProvider(null); setState("reading");
+    fetchJson<ProvidersPage>("/admin/providers?sample=0", { signal: controller.signal, cache: "no-store" })
+      .then(page => {
+        if (controller.signal.aborted) return;
+        if (!Array.isArray(page.providers)) throw new Error("invalid_source_snapshot");
+        const found = page.providers.find(row => row.id === providerId) || null;
+        setReadProviderId(providerId); setProvider(found); setState(found ? "ready" : "missing");
+      })
+      .catch(() => { if (!controller.signal.aborted) { setReadProviderId(providerId); setState("failed"); } });
+    return () => controller.abort();
+  }, [providerId, revision]);
+  return <TaskView title={`来源快照 · ${providerId}`} backLabel="返回原请求" onBack={onBack}>
+    <p className="muted">上方请求事实与当前来源快照分开记录。这里只读取本机状态，不探测额度、刷新目录或调用模型。</p>
+    {requestFacts}
+    {(state === "reading" || readProviderId !== providerId) && <p role="status">正在读取当前来源快照…</p>}
+    {readProviderId === providerId && state === "failed" && <p className="alert error" role="alert">来源快照暂不可读，不能据此判断当前可用性。</p>}
+    {readProviderId === providerId && state === "missing" && <p role="status">当前已找不到此来源；原请求记录仍保留当时事实。</p>}
+    {state === "ready" && readProviderId === providerId && provider?.id === providerId && <section>
+      <h3>当前本机来源状态</h3>
+      <dl className="task-facts">
+        <div><dt>来源</dt><dd>{provider.id}</dd></div>
+        <div><dt>{provider.source === "custom" ? "类别声明" : "类别"}</dt><dd>{provider.kind === "subscription" ? provider.source === "custom" ? "声明订阅" : "订阅" : provider.kind === "free_tier" ? provider.source === "custom" ? "声明免费档" : "免费档类别" : "未知"}</dd></div>
+        <div><dt>路由</dt><dd>{provider.paused ? "已暂停" : provider.routing_disabled ? "因上游限制已停用" : "未暂停；仍受模型、费用与当前条件限制"}</dd></div>
+        <div><dt>凭据</dt><dd>{provider.source_health?.credential.required === false ? "此本地来源无需凭据" : provider.source_health?.credential.required === true ? provider.source_health.credential.usable === true ? "当前本机凭据可读取，不代表本次推理成功" : provider.source_health.credential.usable === false ? "当前本机凭据不可用" : "尚未确认" : "尚未确认"}</dd></div>
+        <div><dt>费用依据</dt><dd>{provider.source_health?.cost.basis === "confirmed_free" ? "此来源至少一个模型有当前确认免费依据；本次请求按其记录核对" : provider.source_health?.cost.basis === "authorized_subscription" ? "订阅费用依据" : "尚未确认"}；订阅使用授权{provider.source_health?.cost.authorized === true ? "已确认" : provider.source_health?.cost.authorized === false ? "未确认" : "状态未知"}，仍受当前费用规则约束</dd></div>
+      </dl>
+    </section>}
+    <button className="ghost" disabled={state === "reading"} onClick={() => setRevision(value => value + 1)}>重新读取本机快照</button>
+  </TaskView>;
 }

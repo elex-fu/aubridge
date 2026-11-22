@@ -122,6 +122,19 @@ async fn wire_unwire_roundtrip_all_agents() {
         before.iter().all(|(_, w, d, _)| !*w && *d),
         "种子配置在,未接线"
     );
+    let initial: serde_json::Value = get_json(&client, &gw, "/admin/agents")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        initial["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|agent| { agent["discovery"]["status"] == "not_checked" }),
+        "已有配置不代表已检查CLI可执行文件或版本"
+    );
 
     for (id, _, _, _) in &before {
         let resp = toggle(&client, &gw, id, true).await;

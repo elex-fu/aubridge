@@ -1,0 +1,23 @@
+{
+  "scope": "Literal metadata-only first lines from two independent private official CLI sessions; no message, marker, account or canonical project path is included.",
+  "version_boundary": "Gemini headers do not contain cli_version. Fixture source versions are established by the independent runtime/package receipts, not inferred from header fields.",
+  "test_boundary": "scan_gemini tests replace only projectHash to bind the literal header to the test's fresh canonical workspace. Original literal bytes and their hashes remain separately preserved here.",
+  "fixtures": {
+    "0.68.0": {
+      "file": "native-gemini-0.68.0.jsonl",
+      "header_sha256": "291a0f7a79d0704d31274614753e8c01f39cf26fd3356bf250486b183404ccc5",
+      "runtime_receipt": ".local/iterations/0116/native-deb69dff46b6-20261120T044731Z/native-gemini-068-runtime-safe.json",
+      "runtime_receipt_sha256": "ad208e08ec2b0f21c176a58b707e5704cf05cfceb31663241936bb000810cdbe",
+      "source_verification": "The seed command entry hash matches gemini_cli.entry_sha256 in the runtime receipt, its package.json version is exactly 0.68.0, and the header sessionId matches the prepared seed UUID. The private manifest PID matches that runtime receipt.",
+      "evidence_limit": "This is a real seeded native header. The saved acceptance state remained prepared; this fixture does not assert successful native resume or GUI recovery."
+    },
+    "0.70.0": {
+      "file": "native-gemini-0.70.0.jsonl",
+      "header_sha256": "d78fa3b9df678a2dec980777dc4030cb217b7e1dccbe346232d66f40d6a4bf66",
+      "runtime_receipt": ".local/iterations/0114/gemini070-case-r3-deb69dff46b6/receipt.json",
+      "runtime_receipt_sha256": "a432355ae57ea5421267371f27253e264174fb8eb5f12708eced5f06f6de10be",
+      "source_verification": "The independent receipt pins official package version 0.70.0, Node and package hashes, and records a successful two-turn direct --resume baseline with the same native ID and record growth.",
+      "evidence_limit": "The source runtime was deb69dff46b6, debug/source, source_verified=false. Direct resume does not prove production job, project, installed-candidate or GUI-handle acceptance."
+    }
+  }
+}

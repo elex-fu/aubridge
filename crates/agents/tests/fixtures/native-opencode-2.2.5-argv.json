@@ -1,0 +1,8 @@
+{
+  "version": "2.2.5",
+  "native_id": "ses_FixtureRoot",
+  "canonical_cwd": "/private/fixture/original-project",
+  "seed_prompt": "Use the read tool to read the private seed file.",
+  "seed_args": ["run", "--standalone", "--format", "json", "Use the read tool to read the private seed file."],
+  "resume_args": ["--standalone", "--session", "ses_FixtureRoot", "/private/fixture/original-project"]
+}

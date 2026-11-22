@@ -192,6 +192,7 @@ fn wired_state(stub: &str, seen: Arc<Mutex<Option<String>>>) -> Arc<GatewayState
     let _ = seen;
     Arc::new(
         GatewayState::with_keys(manifests, "aubridge", keys)
+            .with_client(reqwest::Client::builder().no_proxy().build().unwrap())
             .with_admin_token("test-admin".into())
             .with_ledger(ledger::Ledger::open(":memory:").unwrap())
             .with_plan_fetcher_for("https://open.bigmodel.cn/api/paas/v4", fetcher),

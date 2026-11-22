@@ -22,6 +22,8 @@ pub(crate) struct ReportedUsage {
     pub output: Option<u64>,
     pub cache_read: u64,
     pub cache_write: u64,
+    pub cache_read_reported: bool,
+    pub cache_write_reported: bool,
 }
 
 impl ReportedUsage {
@@ -37,7 +39,7 @@ impl ReportedUsage {
         })
     }
 
-    fn observe(&mut self, protocol: WireProtocol, event: &Value) {
+    pub(crate) fn observe(&mut self, protocol: WireProtocol, event: &Value) {
         let (message, usage, input, output) = match protocol {
             WireProtocol::Chat => (event, &event["usage"], "prompt_tokens", "completion_tokens"),
             WireProtocol::Responses => (
@@ -69,6 +71,7 @@ impl ReportedUsage {
             .or_else(|| count(&usage["input_tokens_details"]["cached_tokens"]))
             .or_else(|| count(&usage["prompt_tokens_details"]["cached_tokens"]));
         self.cache_read = self.cache_read.max(read.unwrap_or_default());
+        self.cache_read_reported |= read.is_some();
         let nested_write = match protocol {
             WireProtocol::Chat => count(&usage["prompt_tokens_details"]["cache_write_tokens"]),
             WireProtocol::Responses => count(&usage["input_tokens_details"]["cache_write_tokens"]),
@@ -76,6 +79,7 @@ impl ReportedUsage {
         };
         let write = count(&usage["cache_creation_input_tokens"]).max(nested_write);
         self.cache_write = self.cache_write.max(write.unwrap_or_default());
+        self.cache_write_reported |= write.is_some();
     }
 }
 
@@ -418,6 +422,7 @@ pub(crate) async fn native_chat_json(
 }
 
 pub(crate) struct Reply {
+    cli_lease: Option<crate::claude_cli::Lease>,
     reader: FrameReader,
     protocol: WireProtocol,
     translator: Translator,
@@ -435,12 +440,16 @@ pub(crate) struct Reply {
 
 impl Reply {
     pub(crate) fn new(
-        response: reqwest::Response,
+        mut response: reqwest::Response,
         protocol: WireProtocol,
         model: &str,
         permit: Option<tokio::sync::OwnedSemaphorePermit>,
     ) -> Self {
+        let cli_lease = response
+            .extensions_mut()
+            .remove::<crate::claude_cli::Lease>();
         Self {
+            cli_lease,
             reader: FrameReader {
                 source: Box::pin(response.bytes_stream()),
                 buffer: Vec::new(),
@@ -458,6 +467,22 @@ impl Reply {
             response_context_exceeded: false,
             embedded_failure: None,
             _permit: permit,
+        }
+    }
+
+    pub(crate) fn abort(&mut self) {
+        self.failed = true;
+        self.ended = true;
+        self.pending.clear();
+        self.reader.source = Box::pin(futures_util::stream::empty());
+        self.reader.buffer.clear();
+        self._permit.take();
+        self.cli_lease.take();
+    }
+
+    pub(crate) fn cli_delivered(&self) {
+        if let Some(lease) = &self.cli_lease {
+            lease.delivered();
         }
     }
 

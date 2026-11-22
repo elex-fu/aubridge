@@ -25,14 +25,7 @@ function snapshot(run: TestRun, state: TestResult["state"], message: string, rec
   return { model: run.model, at: run.at, duration: Math.round(performance.now() - run.started), state, message, receipt, stale: false };
 }
 
-function resultSummary(result: TestResult): string {
-  if (result.stale) return "上次结果，未重新测试";
-  if (result.state === "success") return "上次成功";
-  if (result.state === "failed") return "上次失败";
-  return result.state === "cancelled" ? "已取消等待" : "未确认";
-}
-
-export function ProxyModelTest({ serving, onCheckSources }: { serving: boolean; onCheckSources: () => void }) {
+export function ProxyModelTest({ serving, onCheckSources, onBusyChange }: { serving: boolean; onCheckSources: () => void; onBusyChange: (busy: boolean) => void }) {
   const [models, setModels] = useState<string[] | null>(null);
   const [model, setModel] = useState("aubridge");
   const [catalogLoading, setCatalogLoading] = useState(false);
@@ -116,16 +109,16 @@ export function ProxyModelTest({ serving, onCheckSources }: { serving: boolean; 
     }
   };
 
+  useEffect(() => { void refreshModels(); }, []);
+
   const missing = models !== null && !models.includes(model);
   const busy = running || catalogLoading;
+  useEffect(() => { onBusyChange(running); }, [running, onBusyChange]);
   const receipt = result?.receipt;
   const stateClass = result?.state === "success" ? "success" : result?.state === "failed" ? "bad" : "off";
 
   return (
-    <details className="panel gateway-access model-test" onToggle={event => {
-      if (event.currentTarget.open && models === null && !catalogRequest.current) void refreshModels();
-    }}>
-      <summary>测试模型{(running || result) && <span className="muted"> · {running ? "测试中" : resultSummary(result!)}</span>}</summary>
+    <section className="model-test" aria-label="测试模型">
       <div className="panel-body model-test-body">
         <div className="model-test-controls">
           <div className="field">
@@ -174,6 +167,6 @@ export function ProxyModelTest({ serving, onCheckSources }: { serving: boolean; 
           </>}
         </div>
       </div>
-    </details>
+    </section>
   );
 }

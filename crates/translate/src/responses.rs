@@ -174,7 +174,10 @@ fn translate_assistant<'a>(
                         });
                     }
                     // assistant 消息里的 tool_result 是畸形输入,丢弃。
-                    InboundBlock::ToolResult { .. } | InboundBlock::NativeOnly => {}
+                    InboundBlock::ToolResult { .. }
+                    | InboundBlock::NativeOnly
+                    | InboundBlock::Image { .. }
+                    | InboundBlock::Document { .. } => {}
                 }
             }
         }
@@ -224,7 +227,9 @@ fn translate_user(
                     // 不回放(F-3 只回放 assistant 带签名块),tool_use 丢弃。
                     InboundBlock::Thinking { .. }
                     | InboundBlock::ToolUse { .. }
-                    | InboundBlock::NativeOnly => {}
+                    | InboundBlock::NativeOnly
+                    | InboundBlock::Image { .. }
+                    | InboundBlock::Document { .. } => {}
                 }
             }
         }

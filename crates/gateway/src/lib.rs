@@ -8,26 +8,45 @@
 //! 依赖方向纪律(crate-layout §1):本 crate 是 L2 组装层,可依赖
 //! 一切 L0/L1;接口不泄漏 reqwest 类型。
 
+mod agent_project;
 mod agent_test;
+mod agent_validation;
+mod analytics;
+#[cfg(target_os = "macos")]
+pub mod app_update;
+#[cfg(target_os = "macos")]
+pub mod app_update_helper;
+#[cfg(target_os = "macos")]
+pub mod app_update_package;
+pub mod build_info;
 mod catalog;
 mod chat;
 pub mod chatgpt;
+mod claude_cli;
 pub mod cli;
+mod compaction;
+mod diagnostics;
+mod gemini;
 mod model_catalog;
+mod native_sessions;
 mod openrouter;
+mod pricing;
 mod responses;
 mod route_plan;
 pub mod runtime;
 pub mod security;
+mod session_identity;
 pub mod state;
+pub(crate) use state::usage_policy;
 mod stream;
 pub mod upstream;
+mod validation_routes;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::{rejection::QueryRejection, Query};
+use axum::extract::{rejection::QueryRejection, DefaultBodyLimit, Query, RawQuery};
 use axum::http::{HeaderMap, Response, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
@@ -53,7 +72,57 @@ pub const AUTO_MODEL: &str = "aubridge";
 /// 组装网关 Router。状态由调用方持有(Arc 共享)。
 pub fn app(state: Arc<GatewayState>) -> Router {
     Router::new()
+        .route("/admin/pricing", {
+            let read = state.clone(); let write = state.clone();
+            get(move |headers: HeaderMap| pricing::read(read, headers))
+                .post(move |headers: HeaderMap, body: String| pricing::write(write, headers, body))
+        })
+        .route("/admin/analytics", {
+            let state = state.clone();
+            get(move |headers: HeaderMap, query: Result<Query<analytics::AnalyticsQuery>, QueryRejection>| {
+                analytics::read(state, headers, query)
+            })
+        })
         .route("/healthz", get(|| async { "ok" }))
+        .route("/admin/build", {
+            let state = state.clone();
+            get(move |headers: HeaderMap| async move {
+                if !state.is_valid_admin_key(security::caller_key(&headers).as_deref()) {
+                    return unauthorized();
+                }
+                Json(build_info::current()).into_response()
+            })
+        })
+        .route("/admin/work-config", {
+            let state = state.clone();
+            get(move |headers: HeaderMap| {
+                state::work_config_backup::route(state.clone(), headers, "status".into(), String::new())
+            })
+        })
+        .route("/admin/work-config/{action}", {
+            let state = state.clone();
+            post(move |axum::extract::Path(action): axum::extract::Path<String>, headers: HeaderMap, body: String| {
+                state::work_config_backup::route(state.clone(), headers, action, body)
+            })
+        })
+        .route("/admin/native-sessions", {
+            let state = state.clone();
+            get(move |headers: HeaderMap| native_sessions::list(state.clone(), headers))
+        })
+        .route("/admin/native-sessions/resume", {
+            let state = state.clone();
+            post(move |headers: HeaderMap, body: String| native_sessions::resume(state.clone(), headers, body))
+        })
+        .route("/v1beta/models", {
+            let state=state.clone();
+            get(move |headers:HeaderMap| async move {gemini::models(state,headers)})
+        })
+        .route("/v1beta/models/{*model_action}", {
+            let state=state.clone();
+            post(move |axum::extract::Path(path):axum::extract::Path<String>, headers:HeaderMap, body:String| async move {
+                gemini::route(state,headers,path,body).await
+            })
+        })
         .route("/v1/models", {
             let state = state.clone();
             get(move |headers: HeaderMap| async move { models_route(state.clone(), headers).await })
@@ -64,7 +133,7 @@ pub fn app(state: Arc<GatewayState>) -> Router {
                 let state = state.clone();
                 post(move |headers: HeaderMap, body: String| async move {
                     messages_route(state.clone(), headers, body, false).await
-                })
+                }).layer(DefaultBodyLimit::max(state::request_body::BODY_LIMIT))
             },
         )
         .route(
@@ -73,7 +142,7 @@ pub fn app(state: Arc<GatewayState>) -> Router {
                 let state = state.clone();
                 post(move |headers: HeaderMap, body: String| async move {
                     messages_route(state.clone(), headers, body, true).await
-                })
+                }).layer(DefaultBodyLimit::max(state::request_body::BODY_LIMIT))
             },
         )
         .route(
@@ -82,7 +151,7 @@ pub fn app(state: Arc<GatewayState>) -> Router {
                 let state = state.clone();
                 post(move |headers: HeaderMap, body: String| async move {
                     chat_completions_route(state.clone(), headers, body).await
-                })
+                }).layer(DefaultBodyLimit::max(state::request_body::BODY_LIMIT))
             },
         )
         .route(
@@ -91,9 +160,15 @@ pub fn app(state: Arc<GatewayState>) -> Router {
                 let state = state.clone();
                 post(move |headers: HeaderMap, body: String| async move {
                     responses_route(state.clone(), headers, body).await
-                })
+                }).layer(DefaultBodyLimit::max(state::request_body::BODY_LIMIT))
             },
         )
+        .route("/v1/responses/compact", {
+            let state = state.clone();
+            post(move |headers: HeaderMap, body: String| async move {
+                compaction::route(state, headers, body).await
+            }).layer(DefaultBodyLimit::max(state::request_body::BODY_LIMIT))
+        })
         .route(
             "/admin/dashboard",
             {
@@ -252,12 +327,52 @@ pub fn app(state: Arc<GatewayState>) -> Router {
                 )
             },
         )
+        .route("/admin/agents/{id}/discovery", {
+            let state = state.clone();
+            post(move |axum::extract::Path(id): axum::extract::Path<String>, headers: HeaderMap| {
+                validation_routes::discover(state.clone(), headers, id)
+            })
+        })
+        .route("/admin/agents/{id}/project-check", {
+            let state = state.clone();
+            post(move |axum::extract::Path(id): axum::extract::Path<String>, headers: HeaderMap, body: String| {
+                validation_routes::project_check(state.clone(), headers, id, body)
+            })
+        })
+        .route("/admin/agents/gemini/project-env/preview", {
+            let state = state.clone();
+            post(move |headers: HeaderMap, body: String| {
+                validation_routes::project_env_preview(state.clone(), headers, body)
+            })
+        })
+        .route("/admin/agents/gemini/project-env/apply", {
+            let state = state.clone();
+            post(move |headers: HeaderMap, body: String| {
+                validation_routes::project_env_apply(state.clone(), headers, body)
+            })
+        })
+        .route("/admin/agents/{id}/validation-jobs", {
+            let state = state.clone();
+            post(move |axum::extract::Path(id): axum::extract::Path<String>, headers: HeaderMap, body: String| {
+                validation_routes::start(state.clone(), headers, id, body)
+            })
+        })
+        .route("/admin/agent-validation-jobs/{job_id}", {
+            let read = state.clone();
+            let cancel = state.clone();
+            get(move |axum::extract::Path(id): axum::extract::Path<String>, headers: HeaderMap| async move {
+                validation_routes::job(read.clone(), headers, id, false)
+            })
+            .delete(move |axum::extract::Path(id): axum::extract::Path<String>, headers: HeaderMap| async move {
+                validation_routes::job(cancel.clone(), headers, id, true)
+            })
+        })
         .route(
             "/admin/providers",
             {
                 let state = state.clone();
-                get(move |headers: HeaderMap| async move {
-                    providers_route(state.clone(), headers).await
+                get(move |headers: HeaderMap, RawQuery(query): RawQuery| async move {
+                    providers_route(state.clone(), headers, query).await
                 })
             },
         )
@@ -292,6 +407,18 @@ pub fn app(state: Arc<GatewayState>) -> Router {
             },
         )
         .route(
+            "/admin/providers/{id}/catalog",
+            {
+                let read=state.clone();
+                let refresh=state.clone();
+                get(move |headers: HeaderMap, axum::extract::Path(id): axum::extract::Path<String>| async move {
+                    state::directory::route(&read,&headers,&id,false).await
+                }).post(move |headers: HeaderMap, axum::extract::Path(id): axum::extract::Path<String>| async move {
+                    state::directory::route(&refresh,&headers,&id,true).await
+                })
+            },
+        )
+        .route(
             "/admin/providers/{id}/models",
             {
                 let state = state.clone();
@@ -302,6 +429,18 @@ pub fn app(state: Arc<GatewayState>) -> Router {
                 )
             },
         )
+        .route("/admin/providers/{id}/catalog-selection", {
+            let state=state.clone();
+            post(move |headers:HeaderMap,axum::extract::Path(id):axum::extract::Path<String>,body:String| async move {
+                if !state.is_valid_admin_key(security::caller_key(&headers).as_deref()) {return unauthorized();}
+                #[derive(serde::Deserialize)] struct Selection {models:Vec<String>}
+                let Ok(selection)=serde_json::from_str::<Selection>(&body) else {return error_response(StatusCode::BAD_REQUEST,"models must be a list of strings");};
+                match state.select_directory_models(&id,&selection.models) {
+                    Ok(())=>sync_opencode_models(&state,serde_json::json!({"id":id,"models":selection.models})).into_response(),
+                    Err(error)=>error_response(StatusCode::BAD_REQUEST,&error),
+                }
+            })
+        })
         .route(
             "/admin/providers/{id}/pause",
             {
@@ -338,9 +477,12 @@ pub fn app(state: Arc<GatewayState>) -> Router {
         .route(
             "/admin/providers/openrouter/catalog",
             {
-                let state = state.clone();
-                post(move |headers: HeaderMap| async move {
-                    openrouter_catalog_refresh_route(state.clone(), headers).await
+                let read = state.clone();
+                let refresh = state.clone();
+                get(move |headers: HeaderMap| async move {
+                    state::directory::route(&read, &headers, "openrouter", false).await
+                }).post(move |headers: HeaderMap| async move {
+                    openrouter_catalog_refresh_route(refresh.clone(), headers).await
                 })
             },
         )
@@ -421,6 +563,12 @@ pub fn app(state: Arc<GatewayState>) -> Router {
                 )
             },
         )
+        .route("/admin/gateway/sessions", {
+            let state = state.clone();
+            get(move |headers: HeaderMap, query: Result<Query<GatewayHistoryQuery>, QueryRejection>| async move {
+                gateway_sessions_route(state, headers, query).await
+            })
+        })
         .route(
             "/admin/gateway/history",
             {
@@ -448,6 +596,7 @@ pub fn app(state: Arc<GatewayState>) -> Router {
                 })
             },
         )
+        .layer(axum::middleware::from_fn_with_state(state.clone(), state::request_body::limit))
         .layer(axum::middleware::from_fn_with_state(state, security::guard))
 }
 
@@ -456,10 +605,11 @@ async fn models_route(state: Arc<GatewayState>, headers: HeaderMap) -> Response<
         return unauthorized();
     }
     let models: Vec<String> = state.models();
+    let facts = state.model_facts();
     Json(serde_json::json!({
         "object": "list",
         "data": models.iter().map(|m| serde_json::json!({
-            "id": m, "object": "model", "owned_by": "aubridge"
+            "id": m, "object": "model", "owned_by": "aubridge", "capabilities": facts.get(m)
         })).collect::<Vec<_>>()
     }))
     .into_response()
@@ -567,19 +717,19 @@ async fn dashboard_route(state: Arc<GatewayState>, headers: HeaderMap) -> Respon
     if !state.is_valid_admin_key(key.as_deref()) {
         return error_response(StatusCode::UNAUTHORIZED, "admin key required");
     }
-    let (monthly_savings_status, total, top_providers, card) = match state.monthly_savings().await {
-        Some((total, per)) => {
-            let card = ledger::share_card(total, &per);
-            let top_providers = per
-                .iter()
-                .map(|(provider, cost)| {
-                    serde_json::json!({"provider": provider, "benchmark_cost_usd": cost})
-                })
-                .collect::<Vec<_>>();
-            ("available", Some(total), Some(top_providers), Some(card))
-        }
-        None => ("unavailable", None, None, None),
+    let value = state.monthly_value();
+    let monthly_savings_status = if value.is_some() {
+        "available"
+    } else {
+        "unavailable"
     };
+    let total = value.as_ref().and_then(|value| value.api_equivalent_usd);
+    let top_providers=value.as_ref().map(|value|value.providers.iter().filter_map(|provider|
+        provider.api_equivalent_usd.map(|amount|serde_json::json!({"provider":provider.provider,"benchmark_cost_usd":amount,
+            "api_equivalent_usd":amount,"records":provider.records,"priced_records":provider.priced_records}))).collect::<Vec<_>>());
+    let card=value.as_ref().and_then(|value|value.api_equivalent_usd.map(|total|format!(
+        "本月 API 等值估算 ${total:.2} · 已计价 {}/{} 条用量记录\n缓存读取 {} token · 缓存未报告 {} 条\n对标口径：按已知 token 和价格估算；缓存单价缺失按普通输入估算；未扣订阅费，不代表现金节省。",
+        value.priced_records,value.records,value.cache_read_tokens,value.cache_unknown_records)));
     // codex wham 主动查询(§8.2 第二数据源):查得到就并入快照
     // (缓存 3min,频繁刷新不放大外呼)。
     state.sample_wham_usage().await;
@@ -612,12 +762,14 @@ async fn dashboard_route(state: Arc<GatewayState>, headers: HeaderMap) -> Respon
                 // 窗口利用率(§8.2,百分比;null = 未知)。
                 "util_5h": p.util_5h,
                 "util_7d": p.util_7d,
+                "quota": p.quota.view(now),
             })
         })
         .collect();
     Json(serde_json::json!({
         "monthly_savings_status": monthly_savings_status,
         "monthly_savings_usd": total,
+        "value_summary": value,
         "top_providers": top_providers,
         "share_card": card,
         "providers": providers,
@@ -769,8 +921,12 @@ async fn settings_route(state: Arc<GatewayState>, headers: HeaderMap) -> Respons
         })
     });
     let login = state.chatgpt_login_metadata();
+    let cost_policy = state.cost_policy();
     Json(serde_json::json!({
         "share_login": state.share_login(),
+        "cost_intent": cost_policy.cost_intent,
+        "cost_policy_issue": cost_policy.configuration_issue,
+        "subscription_authorizations": cost_policy.subscription_authorizations,
         "chatgpt_login_source": login.source,
         "chatgpt_login_status": login.status,
         "chatgpt_login_path": login.path,
@@ -796,6 +952,30 @@ async fn settings_set_route(
         Ok(value) => value,
         Err(_) => return error_response(StatusCode::BAD_REQUEST, "bad settings request"),
     };
+    if req.get("cost_intent").is_some() || req.get("subscription_authorizations").is_some() {
+        if req
+            .get("cost_intent")
+            .is_none_or(serde_json::Value::is_null)
+            || req.as_object().is_none_or(|object| {
+                object
+                    .keys()
+                    .any(|key| key != "cost_intent" && key != "subscription_authorizations")
+            })
+        {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "choose one explicit cost policy operation",
+            );
+        }
+        let policy: usage_policy::UsagePolicy = match serde_json::from_value(req) {
+            Ok(policy) => policy,
+            Err(_) => return error_response(StatusCode::BAD_REQUEST, "invalid cost policy"),
+        };
+        return match state.set_cost_policy(policy) {
+            Ok(()) => Json(state.cost_policy()).into_response(),
+            Err(error) => error_response(StatusCode::BAD_REQUEST, &error),
+        };
+    }
     let operation = match (req.get("share_login"), req.get("chatgpt_login_source")) {
         (Some(share), None) => match share.as_bool() {
             Some(on) => (
@@ -1074,6 +1254,8 @@ async fn model_group_delete_route(
 struct RoutingPreviewQuery {
     model: String,
     #[serde(default)]
+    images: bool,
+    #[serde(default)]
     tools: bool,
 }
 
@@ -1086,14 +1268,27 @@ fn routing_preview_route(
     if !state.is_valid_admin_key(key.as_deref()) {
         return error_response(StatusCode::UNAUTHORIZED, "admin key required");
     }
-    let Ok(Query(RoutingPreviewQuery { model, tools })) = query else {
+    let Ok(Query(RoutingPreviewQuery {
+        model,
+        tools,
+        images,
+    })) = query
+    else {
         return error_response(StatusCode::BAD_REQUEST, "invalid routing preview query");
     };
     let request = MessagesRequest {
         model,
         messages: vec![InboundMessage {
             role: "user".into(),
-            content: InboundContent::Text("Reply with OK.".into()),
+            content: if images {
+                InboundContent::Blocks(vec![proto::protocol::InboundBlock::Image {
+                    source: proto::protocol::MediaSource::Url {
+                        url: "https://example.invalid/preview.png".into(),
+                    },
+                }])
+            } else {
+                InboundContent::Text("Reply with OK.".into())
+            },
         }],
         system: None,
         max_tokens: 64,
@@ -1113,6 +1308,16 @@ fn routing_preview_route(
         false,
         tools,
         |manifest, model| {
+            let wire = match manifest.provider.protocol {
+                manifest::schema::WireProtocol::Anthropic => translate::media::Wire::Messages,
+                manifest::schema::WireProtocol::Chat => translate::media::Wire::Chat,
+                manifest::schema::WireProtocol::Responses => translate::media::Wire::Responses,
+            };
+            if let Err(reason) =
+                translate::media::check(&request, wire, wire == translate::media::Wire::Messages)
+            {
+                return Some(route_plan::Block::new(reason, None));
+            }
             (openrouter::applies(manifest) && !catalog::free_id(model))
                 .then(|| route_plan::Block::new(openrouter::RESTRICTED, None))
         },
@@ -1145,6 +1350,10 @@ fn routing_preview_route(
 
 #[derive(serde::Deserialize)]
 struct GatewayHistoryQuery {
+    start: Option<String>,
+    end: Option<String>,
+    session_id: Option<String>,
+    request_id: Option<String>,
     agent: Option<String>,
     provider: Option<String>,
     related_provider: Option<String>,
@@ -1159,6 +1368,30 @@ fn history_cursor(value: &str) -> Option<(u64, i64)> {
     let ts = u64::try_from(ts.parse::<i64>().ok()?).ok()?;
     let rowid = rowid.parse::<i64>().ok()?;
     (rowid > 0).then_some((ts, rowid))
+}
+
+async fn gateway_sessions_route(
+    state: Arc<GatewayState>,
+    headers: HeaderMap,
+    query: Result<Query<GatewayHistoryQuery>, QueryRejection>,
+) -> Response<Body> {
+    if !state.is_valid_admin_key(security::caller_key(&headers).as_deref()) {
+        return error_response(StatusCode::UNAUTHORIZED, "admin key required");
+    }
+    let Ok(Query(query)) = query else {
+        return error_response(StatusCode::BAD_REQUEST, "invalid session query");
+    };
+    let before = match query.before.as_deref() {
+        Some(value) => match history_cursor(value) {
+            Some(cursor) => Some(cursor),
+            None => return error_response(StatusCode::BAD_REQUEST, "invalid session cursor"),
+        },
+        None => None,
+    };
+    match state.session_page(query.agent.as_deref(),query.session_id.as_deref(),before) {
+        Some((sessions,next))=>Json(serde_json::json!({"history_status":"available","sessions":sessions,"next":next.map(|(ts,rowid)|format!("{ts}:{rowid}"))})).into_response(),
+        None=>error_response(StatusCode::SERVICE_UNAVAILABLE,"session history unavailable"),
+    }
 }
 
 /// 代理页的软开关、回环接入方式及本地历史请求。
@@ -1190,31 +1423,68 @@ async fn gateway_route(
     } else {
         None
     };
-    let page = state.decision_page(ledger::DecisionFilter {
-        agent: query
-            .agent
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty()),
-        provider: query
-            .provider
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty()),
-        related_provider: query
-            .related_provider
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty()),
-        outcome,
-        kind,
-        model: query
-            .model
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty()),
-        before,
-    });
+    let ranged = match (&query.start, &query.end) {
+        (None, None) => false,
+        (Some(_), Some(_)) => true,
+        _ => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "start and end must be supplied together",
+            )
+        }
+    };
+    let page_state = state.clone();
+    let read_page = move || {
+        let outcome = query.outcome.as_deref();
+        let kind = query.kind.as_deref();
+        let filter = ledger::DecisionFilter {
+            request_id: query.request_id.as_deref(),
+            session_id: query.session_id.as_deref(),
+            agent: query
+                .agent
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty()),
+            provider: query
+                .provider
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty()),
+            related_provider: query
+                .related_provider
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty()),
+            outcome,
+            kind,
+            model: query
+                .model
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty()),
+            before,
+        };
+        if ranged {
+            page_state.analytics_decision_page(
+                query.start.as_deref().unwrap_or_default(),
+                query.end.as_deref().unwrap_or_default(),
+                filter,
+            )
+        } else {
+            page_state
+                .decision_page(filter)
+                .ok_or(ledger::AnalyticsError::Storage)
+        }
+    };
+    let page = if ranged {
+        match tokio::task::spawn_blocking(read_page).await {
+            Ok(Ok(page)) => Some(page),
+            Ok(Err(error)) => return analytics::error(error),
+            Err(_) => return analytics::error(ledger::AnalyticsError::Storage),
+        }
+    } else {
+        read_page().ok()
+    };
     let (history_status, requests, next) = match page {
         Some(page) => (
             "available",
@@ -1228,6 +1498,7 @@ async fn gateway_route(
         "endpoint": format!("http://127.0.0.1:{}", state.port()),
         "admin_token": state.admin_token(),
         "history_status": history_status,
+        "request_limits": state.request_limits(),
         "requests": requests,
         "next": next,
     }))
@@ -1274,6 +1545,23 @@ async fn gateway_serving_route(
 /// 历史请求行投影(仪表盘与代理页共用):attempts 落库为紧凑 JSON
 /// 字符串,这里解析回数组给 UI(坏行容错为原样字符串)。
 fn decision_row(d: &ledger::DecisionRecord) -> serde_json::Value {
+    let usage = ledger::UsageRecord {
+        model: d.served_model.as_ref().unwrap_or(&d.model).clone(),
+        input_tokens: d.input_tokens,
+        output_tokens: d.output_tokens,
+        cache_read_tokens: d.cache_read_tokens,
+        cache_write_tokens: d.cache_write_tokens,
+        input_includes_cache: d.input_includes_cache,
+        provider: d.provider.clone(),
+        price_snapshot: d.price_snapshot.clone(),
+        benchmark_snapshot: d.benchmark_snapshot.clone(),
+        accounting: if d.outcome == "ok" {
+            ledger::Accounting::Reported
+        } else {
+            ledger::Accounting::Partial
+        },
+        ..Default::default()
+    };
     serde_json::json!({
         "ts": d.ts,
         "model": d.model,
@@ -1289,21 +1577,39 @@ fn decision_row(d: &ledger::DecisionRecord) -> serde_json::Value {
         "skipped": d.skipped.as_deref().and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
             .unwrap_or_else(|| serde_json::json!([])),
         "outcome": d.outcome,
+        "session_id":d.session_id,"parent_session_id":d.parent_session_id,"purpose":d.purpose,
+        "request_id":d.request_id,"request_path":d.request_path,"request_bytes":d.request_bytes,
+        "cache_read_tokens":d.cache_read_tokens,"cache_write_tokens":d.cache_write_tokens,
+        "input_includes_cache":d.input_includes_cache,"price_snapshot":d.price_snapshot,"estimate":usage.estimate(),
+        "benchmark_snapshot":d.benchmark_snapshot,"benchmark_estimate":usage.benchmark_estimate(),
     })
 }
 
 /// Provider 页数据(变更记录 32-①):源行清单(只回 key 状态和来源)。
-async fn providers_route(state: Arc<GatewayState>, headers: HeaderMap) -> Response<Body> {
+async fn providers_route(
+    state: Arc<GatewayState>,
+    headers: HeaderMap,
+    query: Option<String>,
+) -> Response<Body> {
     let key = security::caller_key(&headers);
     if !state.is_valid_admin_key(key.as_deref()) {
         return error_response(StatusCode::UNAUTHORIZED, "admin key required");
     }
     // key plan 配额查询(quota-plan-design §3.3;wham 同构触发,
     // 缓存 180s 保证频繁刷新不放大外呼)。
-    state.sample_plan_quotas().await;
+    let sample = !query
+        .as_deref()
+        .is_some_and(|query| query.split('&').any(|field| field == "sample=0"));
+    let budget = if sample {
+        state.sample_plan_quotas().await;
+        state.openrouter_key_budget().await
+    } else {
+        // No cached-only key-budget accessor exists; absence stays unknown, never triggers HTTP.
+        None
+    };
     Json(serde_json::json!({
         "providers": state.providers_overview(),
-        "openrouter_key_budget": state.openrouter_key_budget().await,
+        "openrouter_key_budget": budget,
         "openrouter_catalog": state.openrouter_catalog(),
     }))
     .into_response()
@@ -1343,10 +1649,14 @@ async fn quota_history_route(
         .filter(|s| !s.is_empty());
     // 按 (provider, window) 分组(升序),窗口内 at 升序——UI 直接
     // 画线,不再二次分组。
-    let mut grouped: BTreeMap<(String, String), Vec<serde_json::Value>> = BTreeMap::new();
-    for p in state.quota_history(provider, since) {
+    let mut grouped: BTreeMap<(String, String, bool), Vec<serde_json::Value>> = BTreeMap::new();
+    let points = match state.quota_history_result(provider, since) {
+        Ok(points) => points,
+        Err(message) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, message),
+    };
+    for p in points {
         grouped
-            .entry((p.provider, p.window))
+            .entry((p.provider, p.window, p.legacy))
             .or_default()
             .push(serde_json::json!({
                 "at": p.at,
@@ -1356,8 +1666,8 @@ async fn quota_history_route(
     }
     let items: Vec<serde_json::Value> = grouped
         .into_iter()
-        .map(|((provider, window), points)| {
-            serde_json::json!({ "provider": provider, "window": window, "points": points })
+        .map(|((provider, window, legacy), points)| {
+            serde_json::json!({ "provider": provider, "window": window, "legacy":legacy, "points": points })
         })
         .collect();
     Json(serde_json::json!({ "items": items })).into_response()
@@ -1400,6 +1710,10 @@ async fn provider_check_route(
     let Ok(Query(query)) = query else {
         return error_response(StatusCode::BAD_REQUEST, "invalid check query");
     };
+    let _activity = match state.begin_update_activity() {
+        Ok(activity) => activity,
+        Err(reason) => return error_response(StatusCode::CONFLICT, reason),
+    };
     match upstream::check_provider(&state, &id, query.model.as_deref()).await {
         Some(result) => Json(result).into_response(),
         None => error_response(StatusCode::NOT_FOUND, "unknown provider"),
@@ -1424,7 +1738,12 @@ async fn provider_pause_route(
         return error_response(StatusCode::BAD_REQUEST, "paused must be a boolean");
     };
     match state.set_provider_paused(&id, request.paused) {
-        Ok(()) => Json(serde_json::json!({"paused": request.paused})).into_response(),
+        Ok(()) => {
+            if id == crate::claude_cli::ID && !request.paused {
+                state.refresh_claude_cli().await;
+            }
+            Json(serde_json::json!({"paused": request.paused})).into_response()
+        }
         Err(error) => error_response(StatusCode::BAD_REQUEST, &error),
     }
 }
@@ -1782,6 +2101,14 @@ pub(crate) async fn serve_with_ledger_flush(
             loop {
                 tick.tick().await;
                 state.flush_router_state();
+            }
+        } => Ok(()),
+        () = async {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(state::quota::POLL_SECS));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                state.sample_quotas().await;
             }
         } => Ok(()),
     }

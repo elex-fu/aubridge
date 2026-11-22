@@ -1,17 +1,16 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   ModelGroup,
   ModelGroupPreview,
   ModelGroupsPage,
   OpenCodeSyncReceipt,
   ProvidersPage,
-  deleteJson,
   fetchJson,
-  postJson,
   reportOpenCodeSync,
 } from "./api";
 import { fmtRouteReason, fmtTime } from "./format";
 import { Dialog } from "./Dialog";
+import { TaskView } from "./TaskView";
 
 // 路由规则 = 固定枚举,只选择(ui-design §6.3,magpie 反面教训:
 // 没有规则编辑器/嵌套/意图路由)。
@@ -20,8 +19,19 @@ const RULES: { value: string; label: string }[] = [
   { value: "free_only", label: "仅免费档" },
   { value: "sequential", label: "顺序兜底" },
   { value: "round_robin", label: "轮流" },
+  { value: "smart", label: "免费优先 · 订阅临期先用" },
+  { value: "pace", label: "免费优先 · 订阅按每小时可用额度" },
 ];
+const RULE_HELP: Record<string,string> = {
+  free_first:"先尝试可用免费档，再尝试订阅；仍受全局费用范围限制。",
+  free_only:"只使用免费档类别来源；类别不等于价格已确认免费。",
+  sequential:"按已选成员顺序尝试可用来源。",
+  round_robin:"按现有轮次选择首个可用成员。",
+  smart:"免费优先，订阅按现有额度窗口的临期程度排序。",
+  pace:"免费优先，订阅按现有每小时可用额度排序。",
+};
 const FREE_ONLY_WARNING = "缺少免费档成员";
+type GroupWrite = { phase: "saving" | "reading" | "unknown" | "idle"; message: string; syncIssue?: string | null; navigation?: boolean };
 
 // 新建/编辑分组表单(upsert by name):对外名 + 成员多选(字面
 // 模型)+ 成员顺序 + 规则。
@@ -32,6 +42,10 @@ function GroupForm({
   saving,
   setSaving,
   onDone,
+  saveGroup,
+  blocked,
+  statusFor,
+  onRead,
   onCancel,
   setErr,
 }: {
@@ -41,9 +55,14 @@ function GroupForm({
   saving: boolean;
   setSaving: (saving: boolean) => void;
   onDone: () => Promise<void>;
+  saveGroup: (group: ModelGroup, originalName?: string) => Promise<boolean>;
+  blocked: (name: string) => boolean;
+  statusFor: (name: string) => GroupWrite | undefined;
+  onRead: (name: string) => void;
   onCancel: () => void;
   setErr: (s: string) => void;
 }) {
+  const submitting = useRef(false);
   const [name, setName] = useState(initial?.name ?? "");
   const [members, setMembers] = useState<string[]>(initial?.members ?? []);
   const [rule, setRule] = useState(initial?.rule ?? "free_first");
@@ -69,15 +88,15 @@ function GroupForm({
   };
 
   const save = async () => {
-    if (saving || !name || !members.length) return;
+    if (submitting.current || saving || !name || !members.length || blocked(name) || (initial && blocked(initial.name))) return;
+    submitting.current = true;
     setSaving(true);
     try {
-      const receipt = await postJson<OpenCodeSyncReceipt>("/admin/model-groups", { name, members, rule });
-      reportOpenCodeSync(receipt, setErr);
-      await onDone();
+      if (await saveGroup({ name, members, rule }, initial?.name)) await onDone();
     } catch (e) {
       setErr(`保存分组失败:${e}`);
     } finally {
+      submitting.current = false;
       setSaving(false);
     }
   };
@@ -95,6 +114,7 @@ function GroupForm({
           </select>
         </label>
       </div>
+      <p className="muted">{RULE_HELP[rule] ?? "规则说明未知。"}</p>
       <p className="section-label">选择成员 <span className="muted">· 新选成员添加到末尾</span></p>
       <div className="member-options">
         {options.map(m => (
@@ -132,10 +152,14 @@ function GroupForm({
       )}
       <div className="actions">
         <button type="button" disabled={saving} onClick={onCancel}>取消</button>
-        <button className="button-primary" type="submit" disabled={saving || !name || !members.length}>
+        <button className="button-primary" type="submit" disabled={saving || !name || !members.length || blocked(name) || Boolean(initial && blocked(initial.name))}>
           {saving ? "保存中…" : "保存分组"}
         </button>
       </div>
+      {statusFor(name) && <div role="status">{statusFor(name)?.message}
+        {statusFor(name)?.syncIssue && <span> · OpenCode 模型同步失败：{statusFor(name)?.syncIssue}</span>}
+        {statusFor(name)?.phase === "unknown" && <button type="button" className="ghost" onClick={() => onRead(name)}>读取当前状态</button>}
+      </div>}
     </form>
   );
 }
@@ -216,27 +240,151 @@ function RoutePreview({ name, onClose }: { name: string; onClose: () => void }) 
 // = 字面模型名,对外无感)+ 跨模型合并(自定义对外名)。自动
 // (aubridge)内置行不可删。字面模型默认免费优先(网关天然行为),
 // 想换规则 = 建同名分组。
-export function Models({ setErr }: { setErr: (s: string) => void }) {
+export function Models({ setErr, onBusyChange }: { setErr: (s: string) => void; onBusyChange?: (busy: boolean) => void }) {
   const [groups, setGroups] = useState<ModelGroupsPage | null>(null);
   const [provs, setProvs] = useState<ProvidersPage | null>(null);
   const [loadFailed, setLoadFailed] = useState(false);
-  const [form, setForm] = useState<ModelGroup | null>(null); // null = 收起
+  const [form, setForm] = useState<ModelGroup | null>(null); // null = 新建草稿
   const [showForm, setShowForm] = useState(false);
+  const [formVisited,setFormVisited]=useState(false);
+  const [draftRevision,setDraftRevision]=useState(0);
+  const [detail,setDetail]=useState<{title:string;items:string[]}|null>(null);
+  const taskTrigger=useRef<HTMLElement|null>(null);
+  const openDetail=(value:{title:string;items:string[]})=>{taskTrigger.current=document.activeElement instanceof HTMLElement?document.activeElement:null;setDetail(value);};
+  const returnFocus=()=>window.requestAnimationFrame(()=>taskTrigger.current?.focus());
+  const finishDraft=()=>{setShowForm(false);setFormVisited(false);setForm(null);setDraftRevision(current=>current+1);returnFocus();};
   const [saving, setSaving] = useState(false);
   const [preview, setPreview] = useState<string | null>(null);
   const [deleteGroup, setDeleteGroup] = useState<ModelGroup | null>(null);
 
-  const load = () => {
-    setLoadFailed(false);
-    const groupsLoaded = fetchJson<ModelGroupsPage>("/admin/model-groups")
-      .then(setGroups)
-      .catch(e => { setLoadFailed(true); setErr(String(e)); });
-    fetchJson<ProvidersPage>("/admin/providers")
-      .then(setProvs)
-      .catch(e => { setLoadFailed(true); setErr(String(e)); });
-    return groupsLoaded;
+  const [writes, setWrites] = useState(new Map<string, GroupWrite>());
+  const writeRef = useRef(new Map<string, GroupWrite>());
+  const fresh = useRef(false);
+  const originalTargets = useRef(new Map<string, string>());
+  const deleting = useRef(false);
+  const mounted = useRef(false);
+  const mountGeneration = useRef(0);
+  const loadSequence = useRef(0);
+  const requests = useRef(new Set<AbortController>());
+  const busyCallback = useRef(onBusyChange);
+  busyCallback.current = onBusyChange;
+  const setWrite = (name: string, value: GroupWrite) => {
+    if (!mounted.current) return;
+    const previous = writeRef.current.get(name);
+    writeRef.current.set(name, {
+      ...value,
+      syncIssue: value.syncIssue === undefined ? previous?.syncIssue : value.syncIssue,
+      navigation: value.phase === "saving" || value.phase === "reading" && previous?.navigation === true,
+    });
+    setWrites(new Map(writeRef.current));
+    busyCallback.current?.([...writeRef.current.values()].some(item => item.navigation));
   };
-  useEffect(() => { void load(); }, [setErr]);
+  const request = async <T,>(path: string, init?: RequestInit): Promise<T> => {
+    const controller = new AbortController();
+    requests.current.add(controller);
+    let timer: ReturnType<typeof window.setTimeout> | undefined;
+    try {
+      const value = await Promise.race([
+        fetchJson<T>(path, { ...init, signal: controller.signal, cache: "no-store" }),
+        new Promise<never>((_, reject) => {
+          timer = window.setTimeout(() => { controller.abort(); reject(new Error("等待当前请求超过 10 秒，结果未确认")); }, 10_000);
+        }),
+      ]);
+      if (controller.signal.aborted) throw new Error("请求已停止，结果未确认");
+      return value;
+    } finally { window.clearTimeout(timer); requests.current.delete(controller); }
+  };
+  const readGroups = async () => {
+    const value = await request<ModelGroupsPage>("/admin/model-groups");
+    if (!value || !Array.isArray(value.groups) || value.groups.some(group =>
+      !group || typeof group.name !== "string" || typeof group.rule !== "string" || !Array.isArray(group.members) || group.members.some(member => typeof member !== "string"))) throw new Error("模型分组状态格式未确认");
+    return { ...value, groups: value.groups };
+  };
+  const load = async () => {
+    const generation = mountGeneration.current;
+    const sequence = ++loadSequence.current;
+    const current = () => mounted.current && generation === mountGeneration.current && sequence === loadSequence.current;
+    setLoadFailed(false);
+    fresh.current = false;
+    await Promise.all([
+      readGroups().then(value => { if (current()) { setGroups(value); fresh.current = true; } })
+        .catch(e => { if (current()) { setLoadFailed(true); setErr(String(e)); } }),
+      request<ProvidersPage>("/admin/providers").then(value => { if (current()) setProvs(value); })
+        .catch(e => { if (current()) { setLoadFailed(true); setErr(String(e)); } }),
+    ]);
+  };
+  useEffect(() => {
+    mounted.current = true;
+    mountGeneration.current += 1;
+    void load();
+    return () => { mounted.current = false; requests.current.forEach(controller => controller.abort()); busyCallback.current?.(false); };
+  }, [setErr]);
+  const blocked = (name: string) => !fresh.current || [name, originalTargets.current.get(name)].some(key =>
+    key !== undefined && ["saving", "reading", "unknown"].includes(writeRef.current.get(key)?.phase ?? ""));
+  const readBack = async (name: string, posted = false, deleted = false) => {
+    setWrite(name, { phase: "reading", message: "正在读取当前状态…" });
+    try {
+      const value = await readGroups();
+      if (!mounted.current) return false;
+      const row = value.groups.find(group => group.name === name);
+      if (!row && !deleted) {
+        setWrite(name, { phase: "unknown", message: "找不到此分组，当前状态未确认；不能继续修改旧记录。" });
+        return false;
+      }
+      setGroups(current => {
+        if (!current) return current;
+        const existing = current.groups ?? [];
+        const next = row
+          ? existing.some(group => group.name === name) ? existing.map(group => group.name === name ? row : group) : [...existing, row]
+          : existing.filter(group => group.name !== name);
+        return { ...current, groups: next };
+      });
+      for (const [original, target] of originalTargets.current) {
+        if (target === name) originalTargets.current.delete(original);
+      }
+      setWrite(name, { phase: "idle", message: posted ? "已读取当前状态。" : "已读取当前状态；这不代表上次提交已成功。" });
+      return true;
+    } catch (e) {
+      if (mounted.current) {
+        setWrite(name, { phase: "unknown", message: "保存结果未确认，请先读取当前状态；不会自动重发。" });
+        setErr(`读取 ${name} 当前状态失败:${e}`);
+      }
+      return false;
+    }
+  };
+  const writeGroup = async (name: string, method: "POST" | "DELETE", body?: ModelGroup, originalName?: string) => {
+    if (blocked(name) || (originalName && blocked(originalName))) return false;
+    if (originalName && originalName !== name) originalTargets.current.set(originalName, name);
+    setWrite(name, { phase: "saving", message: "保存中…", syncIssue: null });
+    let posted = false;
+    try {
+      const receipt = await request<OpenCodeSyncReceipt>(method === "DELETE" ? `/admin/model-groups/${encodeURIComponent(name)}` : "/admin/model-groups", {
+        method, ...(body ? { headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {}),
+      });
+      if (!mounted.current) return false;
+      reportOpenCodeSync(receipt, setErr);
+      if (receipt.opencode_issue) setWrite(name, { phase: "saving", message: "保存响应已收到，正在核对…", syncIssue: receipt.opencode_issue });
+      posted = true;
+    } catch (e) { if (mounted.current) setErr(`保存 ${name} 的结果未确认:${e}`); }
+    if (!mounted.current) return false;
+    const confirmed = await readBack(name, posted, method === "DELETE");
+    return posted && confirmed;
+  };
+  const retryRead = (name: string) => {
+    if (writeRef.current.get(name)?.phase === "unknown") void readBack(name);
+  };
+  const statusKey = (name: string) => {
+    const target = originalTargets.current.get(name);
+    return target && ["saving", "reading", "unknown"].includes(writes.get(target)?.phase ?? "") ? target : name;
+  };
+  const writeStatus = (name: string) => {
+    const key = statusKey(name);
+    const value = writes.get(key);
+    return value && <div role="status">{key !== name && `同组另存为 ${key}：`}{value.message}
+      {value.syncIssue && <span> · OpenCode 模型同步失败：{value.syncIssue}</span>}
+      {value.phase === "unknown" && <button className="ghost" onClick={() => retryRead(key)}>读取当前状态</button>}
+    </div>;
+  };
 
   if (!groups || !provs) return <p className="status-loading" role="status">{loadFailed ? "模型数据暂不可读取。" : "正在读取模型…"}{loadFailed && <button className="ghost" onClick={() => void load()}>重试</button>}</p>;
 
@@ -261,65 +409,40 @@ export function Models({ setErr }: { setErr: (s: string) => void }) {
       return member;
     });
     return <>
-      {labels.length > 2 ? <details className="section-details"><summary>{labels.length} 个成员</summary><ol>{labels.map((label, index) => <li key={index}>{label}</li>)}</ol></details> : labels.join(" + ")}
+      {labels.length > 2 ? <button className="ghost" onClick={()=>openDetail({title:`${group.name} 的成员`,items:labels})}>查看 {labels.length} 个成员</button> : labels.join(" + ")}
       {freeOnly && !group.members.some(m => freeModels.has(m)) && (
         <div><span className="badge bad">{FREE_ONLY_WARNING}</span></div>
       )}
     </>;
   };
 
-  const setRule = async (g: ModelGroup, rule: string) => {
-    try {
-      const receipt = await postJson<OpenCodeSyncReceipt>("/admin/model-groups", { name: g.name, members: g.members, rule });
-      reportOpenCodeSync(receipt, setErr);
-      load();
-    } catch (e) {
-      setErr(`改 ${g.name} 规则失败:${e}`);
-    }
+  const setRule = (g: ModelGroup, rule: string) => {
+    if (saving || blocked(g.name)) return;
+    void writeGroup(g.name, "POST", { name: g.name, members: g.members, rule });
   };
 
   const remove = async (g: ModelGroup) => {
-    if (saving) return;
+    if (deleting.current || saving || blocked(g.name)) return;
+    deleting.current = true;
     setSaving(true);
-    try {
-      const receipt = await deleteJson<OpenCodeSyncReceipt>(`/admin/model-groups/${encodeURIComponent(g.name)}`);
-      reportOpenCodeSync(receipt, setErr);
-      setDeleteGroup(null);
-      load();
-    } catch (e) {
-      setErr(`删除分组 ${g.name} 失败:${e}`);
-      setDeleteGroup(null);
-    } finally {
-      setSaving(false);
-    }
+    try { await writeGroup(g.name, "DELETE"); }
+    finally { deleting.current = false; if (mounted.current) { setSaving(false); setDeleteGroup(null); } }
   };
 
   return (
     <div className="models-page management-page">
+      <div className="task-workspace-pane" hidden={showForm || detail!==null}>
       <div className="page-heading">
         <div><h2 className="page-title">模型</h2><p className="page-description">组合模型，选择固定的调度规则</p></div>
-        <button className="button-primary" disabled={saving} onClick={() => { setShowForm(showForm && form === null ? false : true); setForm(null); }}>
-          {showForm && !form ? "收起分组" : "新建分组"}
+        <button className="button-primary" disabled={saving} onClick={() => { taskTrigger.current=document.activeElement instanceof HTMLElement?document.activeElement:null;setShowForm(true);setFormVisited(true); setForm(null); }}>
+          新建分组
         </button>
       </div>
       <div className="panel status-line">
         <strong>自动 (aubridge)</strong>
-        <span className="muted">全部源自动调度，免费档优先，订阅兜底</span>
+        <span className="muted">按当前费用设置与可用条件自动选择合格模型</span>
         <span className="badge off">内置 · 不可删</span>
       </div>
-      {showForm && (
-        <GroupForm
-          key={form?.name ?? ""}
-          initial={form}
-          literalModels={literalModels}
-          freeModels={freeModels}
-          saving={saving}
-          setSaving={setSaving}
-          onDone={async () => { await load(); setShowForm(false); }}
-          onCancel={() => setShowForm(false)}
-          setErr={setErr}
-        />
-      )}
       <div className="table-scroll panel">
       <table className="models-table">
         <thead>
@@ -338,12 +461,12 @@ export function Models({ setErr }: { setErr: (s: string) => void }) {
               <tr key={m}>
                 <td>{m}</td>
                 <td className="muted">
-                  {g ? membersLabel(g) : srcs.length > 2 ? <details className="section-details"><summary>{srcs.length} 个源</summary><ul>{srcs.map(id => <li key={id}>{id}</li>)}</ul></details> : srcs.join(" · ")}
+                  {g ? membersLabel(g) : srcs.length > 2 ? <button className="ghost" onClick={()=>openDetail({title:`${m} 的来源`,items:srcs})}>查看 {srcs.length} 个来源</button> : srcs.join(" · ")}
                   {srcs.length > 1 && !g && <span className="hint">默认免费优先</span>}
                 </td>
                 <td>
                   {g ? (
-                    <select aria-label={`${g.name} 的规则`} value={g.rule} disabled={saving} onChange={e => setRule(g, e.target.value)}>
+                    <select aria-label={`${g.name} 的规则`} value={g.rule} disabled={saving || blocked(g.name)} onChange={e => setRule(g, e.target.value)}>
                       {RULES.map(r => (
                         <option key={r.value} value={r.value}>
                           {r.label}
@@ -356,18 +479,19 @@ export function Models({ setErr }: { setErr: (s: string) => void }) {
                       disabled={saving}
                       onClick={() => {
                         setForm({ name: m, members: [m], rule: "free_first" });
-                        setShowForm(true);
+                        taskTrigger.current=document.activeElement instanceof HTMLElement?document.activeElement:null;setShowForm(true);setFormVisited(true);
                       }}
                     >
                       免费优先 · 设置
                     </button>
                   )}
+                  {g && <><p className="muted">{RULE_HELP[g.rule] ?? "规则说明未知。"}</p>{writeStatus(g.name)}</>}
                 </td>
                 <td>
                   {g && <>
                     <button className="ghost" onClick={() => setPreview(g.name)}>预览路由</button>{" "}
-                    <button className="ghost" disabled={saving} onClick={() => { setForm(g); setShowForm(true); }}>编辑</button>{" "}
-                    <button className="ghost button-danger" disabled={saving} onClick={() => setDeleteGroup(g)}>删除</button>
+                    <button className="ghost" disabled={saving || blocked(g.name)} onClick={() => { if (blocked(g.name)) return; setForm(g); taskTrigger.current=document.activeElement instanceof HTMLElement?document.activeElement:null;setShowForm(true);setFormVisited(true); }}>编辑</button>{" "}
+                    <button className="ghost button-danger" disabled={saving || blocked(g.name)} onClick={() => { if (!blocked(g.name)) setDeleteGroup(g); }}>删除</button>
                   </>}
                 </td>
               </tr>
@@ -383,27 +507,29 @@ export function Models({ setErr }: { setErr: (s: string) => void }) {
                 </td>
                 <td className="muted">{membersLabel(g)}</td>
                 <td>
-                  <select aria-label={`${g.name} 的规则`} value={g.rule} disabled={saving} onChange={e => setRule(g, e.target.value)}>
+                  <select aria-label={`${g.name} 的规则`} value={g.rule} disabled={saving || blocked(g.name)} onChange={e => setRule(g, e.target.value)}>
                     {RULES.map(r => (
                       <option key={r.value} value={r.value}>
                         {r.label}
                       </option>
                     ))}
                   </select>
+                  <p className="muted">{RULE_HELP[g.rule] ?? "规则说明未知。"}</p>{writeStatus(g.name)}
                 </td>
                 <td>
                   <button className="ghost" onClick={() => setPreview(g.name)}>预览路由</button>{" "}
                   <button
                     className="ghost"
-                    disabled={saving}
+                    disabled={saving || blocked(g.name)}
                     onClick={() => {
+                      if (blocked(g.name)) return;
                       setForm(g);
-                      setShowForm(true);
+                      taskTrigger.current=document.activeElement instanceof HTMLElement?document.activeElement:null;setShowForm(true);setFormVisited(true);
                     }}
                   >
                     编辑
                   </button>{" "}
-                  <button className="ghost button-danger" disabled={saving} onClick={() => setDeleteGroup(g)}>
+                  <button className="ghost button-danger" disabled={saving || blocked(g.name)} onClick={() => { if (!blocked(g.name)) setDeleteGroup(g); }}>
                     删除
                   </button>
                 </td>
@@ -412,16 +538,31 @@ export function Models({ setErr }: { setErr: (s: string) => void }) {
         </tbody>
       </table>
       </div>
-      <details className="section-details">
-        <summary>四种规则如何选择</summary>
-        <p className="muted">顺序兜底按成员列表顺序尝试。免费优先先尝试可用免费档，再由订阅兜底。仅免费档只使用免费源。轮流以成员列表为基础应用现有轮次，下一次首选取决于轮次和候选可用性。</p>
-      </details>
+      </div>
+      {formVisited && <div className="task-workspace-pane" hidden={!showForm}><TaskView title={form ? `编辑模型分组 · ${form.name}` : "新建模型分组"} busy={saving} onBack={()=>{setShowForm(false);returnFocus();}}>
+        <GroupForm
+          key={`${draftRevision}:${form?.name ?? "new"}`}
+          initial={form}
+          literalModels={literalModels}
+          freeModels={freeModels}
+          saving={saving}
+          setSaving={setSaving}
+          saveGroup={(group, originalName) => writeGroup(group.name, "POST", group, originalName)}
+          blocked={blocked}
+          statusFor={name => writes.get(statusKey(name))}
+          onRead={name => retryRead(statusKey(name))}
+          onDone={async () => { finishDraft(); }}
+          onCancel={finishDraft}
+          setErr={setErr}
+        />
+      </TaskView></div>}
+      {detail && <TaskView title={detail.title} onBack={()=>{setDetail(null);returnFocus();}}><ol>{detail.items.map((item,index)=><li key={index}>{item}</li>)}</ol></TaskView>}
       {deleteGroup && <Dialog labelledBy="delete-model-group-title" role="alertdialog" busy={saving} onClose={() => setDeleteGroup(null)}>
         <div className="modal-header"><h2 id="delete-model-group-title">删除模型分组？</h2></div>
         <div className="modal-body"><p>删除 {deleteGroup.name} 的分组配置。正在使用这个对外名称的 Agent 可能受到影响。</p></div>
         <div className="modal-actions">
           <button autoFocus disabled={saving} onClick={() => setDeleteGroup(null)}>取消</button>
-          <button className="button-danger" disabled={saving} onClick={() => void remove(deleteGroup)}>{saving ? "删除中…" : "确认删除"}</button>
+          <button className="button-danger" disabled={saving || blocked(deleteGroup.name)} onClick={() => void remove(deleteGroup)}>{saving ? "删除中…" : "确认删除"}</button>
         </div>
       </Dialog>}
       {preview !== null && <RoutePreview key={preview} name={preview} onClose={() => setPreview(null)} />}

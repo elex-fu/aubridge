@@ -27,6 +27,7 @@ pub struct OpenCode {
     pub state_dir: PathBuf,
     pub port: u16,
     pub models: Vec<(String, String)>,
+    model_facts: std::collections::BTreeMap<String, manifest::model::ModelFacts>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -83,11 +84,20 @@ impl OpenCode {
             state_dir,
             port,
             models: Vec::new(),
+            model_facts: Default::default(),
         }
     }
 
     pub fn with_models(mut self, models: Vec<(String, String)>) -> Self {
         self.models = models;
+        self
+    }
+
+    pub fn with_model_facts(
+        mut self,
+        facts: std::collections::BTreeMap<String, manifest::model::ModelFacts>,
+    ) -> Self {
+        self.model_facts = facts;
         self
     }
 
@@ -342,7 +352,22 @@ impl OpenCode {
         let models: serde_json::Map<String, Value> = self
             .models
             .iter()
-            .map(|(id, name)| (id.clone(), json!({"name": name})))
+            .map(|(id, name)| {
+                let mut model=json!({"name":name});
+                if let Some(facts)=self.model_facts.get(id) {
+                    if let Some(name)=&facts.name {model["name"]=json!(name);}
+                    let mut limit=serde_json::Map::new();
+                    if let Some(context)=facts.context {limit.insert("context".into(),json!(context));}
+                    if let Some(output)=facts.output {limit.insert("output".into(),json!(output));}
+                    if !limit.is_empty() {model["limit"]=json!(limit);}
+                    if let Some(tools)=facts.tools {model["tool_call"]=json!(tools);}
+                    if let Some(reasoning)=facts.reasoning {model["reasoning"]=json!(reasoning);}
+                    if !facts.input_modalities.is_empty() && !facts.output_modalities.is_empty() {
+                        model["modalities"]=json!({"input":facts.input_modalities,"output":facts.output_modalities});
+                    }
+                }
+                (id.clone(),model)
+            })
             .collect();
         json!({
             "npm": SDK, "name": "aubridge",

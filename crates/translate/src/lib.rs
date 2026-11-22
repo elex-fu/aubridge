@@ -13,6 +13,7 @@ pub mod chat_input;
 pub mod common;
 pub mod count;
 mod emit;
+pub mod media;
 pub mod responses;
 pub mod responses_input;
 
@@ -26,3 +27,6 @@ pub use responses::{
     map_incomplete_reason, messages_request_to_responses, parse_responses_stream,
     tool_choice_to_responses, ResponsesToAnthropic,
 };
+
+pub mod gemini_input;
+pub mod gemini_output;

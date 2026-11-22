@@ -15,6 +15,7 @@ use crate::state::GatewayState;
 pub(crate) enum Credential {
     Key(String),
     ChatGpt,
+    ClaudeCli,
     Local,
 }
 
@@ -233,10 +234,39 @@ pub(crate) fn plan(
                         (native_only && manifest.provider.protocol != WireProtocol::Anthropic)
                             .then(|| Block::new("native-protocol-required", None))
                     })
+                    .or_else(|| {
+                        (state.is_chatgpt(&manifest) && translate::media::has_documents(req))
+                            .then(|| Block::new(translate::media::UNSUPPORTED, None))
+                    })
+                    .or_else(|| {
+                        state
+                            .cost_block(&manifest, model, now)
+                            .map(|reason| Block::new(reason, None))
+                    })
                     .or_else(|| request_block(&manifest, model))
+                    .or_else(|| {
+                        (state.directory_availability(&manifest, model) == Some(false))
+                            .then(|| Block::new("model-not-listed", None))
+                    })
                     .or_else(|| {
                         (tools && manifest.models_without_tools.contains(model))
                             .then(|| Block::new("tools-unsupported", None))
+                    })
+                    .or_else(|| {
+                        let facts = manifest.model_facts.get(model)?;
+                        if translate::media::has_images(req) && facts.image_input == Some(false) {
+                            return Some(Block::new(translate::media::IMAGE_UNSUPPORTED, None));
+                        }
+                        if facts.output.is_some_and(|limit| {
+                            u64::try_from(req.max_tokens).is_ok_and(|requested| requested > limit)
+                        }) {
+                            return Some(Block::new("output-limit-exceeded", None));
+                        }
+                        let reasoning = req.thinking.as_ref().is_some_and(|thinking| {
+                            matches!(thinking["type"].as_str(), Some("enabled" | "adaptive"))
+                        });
+                        (reasoning && facts.reasoning == Some(false))
+                            .then(|| Block::new("reasoning-unsupported", None))
                     });
                 let block = ineligible.or_else(|| {
                     compatible.push((source.id.clone(), model.clone()));
@@ -305,7 +335,7 @@ pub(crate) fn plan(
         ordered
     };
     // Ordered and rotating groups retain their explicit order.
-    if rule == GroupRule::FreeFirst {
+    if rule.prefers_free() {
         if let Some(entry) = session_key(req, headers).and_then(|key| state.stick(&key)) {
             if let Some(manifest) = state.manifest(&entry.main) {
                 router::affinity::apply_affinity(
@@ -319,7 +349,7 @@ pub(crate) fn plan(
             }
         }
     }
-    let free_first = auto || (members.is_some() && rule == GroupRule::FreeFirst);
+    let free_first = auto || (members.is_some() && rule.prefers_free());
     if free_first {
         router::group::prioritize_free(&mut ordered, now);
     }
@@ -429,6 +459,12 @@ pub(crate) fn credential_with_key(
     manifest: &Manifest,
     resolve_key: impl FnOnce() -> Option<String>,
 ) -> Option<Credential> {
+    if manifest.provider.auth == manifest::schema::AuthKind::ClaudeCli {
+        return (crate::claude_cli::owns(manifest)
+            && !state.provider_paused(crate::claude_cli::ID)
+            && state.claude_cli.ready())
+        .then_some(Credential::ClaudeCli);
+    }
     if state.is_chatgpt(manifest) {
         return state.has_chatgpt_login().then_some(Credential::ChatGpt);
     }
@@ -461,9 +497,8 @@ fn request_needs(req: &MessagesRequest) -> (bool, bool) {
                     InboundBlock::ToolResult { content, .. } => {
                         needs_tools = true;
                         if let ToolResultContent::Blocks(blocks) = content {
-                            native_only |= blocks
-                                .iter()
-                                .any(|b| !b.kind.is_empty() && b.kind != "text");
+                            native_only |=
+                                blocks.iter().any(|b| matches!(b, InboundBlock::NativeOnly));
                         }
                     }
                     _ => {}

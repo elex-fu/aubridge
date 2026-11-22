@@ -63,6 +63,7 @@ impl ResponsesInput {
             || raw["input"]
                 .as_array()
                 .is_some_and(|items| items.iter().any(|item| item["type"] == "additional_tools"));
+        crate::media::validate_raw(&raw, crate::media::Wire::Responses)?;
         let mut bridge = Bridge::default();
         let fields_supported = object.iter().all(|(field, value)| {
             value.is_null()
@@ -92,7 +93,17 @@ impl ResponsesInput {
                         .iter()
                         .all(|value| value == "reasoning.encrypted_content")
                 }));
-        let mut compatible = fields_supported;
+        let mut compatible = fields_supported
+            && !raw["input"].as_array().into_iter().flatten().any(|item| {
+                [&item["content"], &item["output"]].iter().any(|parts| {
+                    parts.as_array().into_iter().flatten().any(|part| {
+                        part["type"] == "input_image"
+                            && part["detail"]
+                                .as_str()
+                                .is_some_and(|detail| detail != "auto")
+                    })
+                })
+            });
         if let Some(instructions) = raw["instructions"].as_str() {
             bridge.instructions.push(instructions.into());
         } else if !raw["instructions"].is_null() {
@@ -125,6 +136,7 @@ impl ResponsesInput {
             thinking: None,
             output_config: None,
         };
+        crate::media::check(&request, crate::media::Wire::Responses, true)?;
         Ok(Self {
             request,
             tool_names: bridge.names,
@@ -153,6 +165,10 @@ impl ResponsesInput {
             }]);
         }
         body
+    }
+
+    pub fn original(&self) -> &Value {
+        &self.raw
     }
 
     pub fn parallel_tools_disabled(&self) -> bool {
@@ -205,10 +221,23 @@ impl Bridge {
         match kind {
             "message" => {
                 let role = item["role"].as_str()?;
-                let content = text_content(&item["content"])?;
+                let content = blocks_content(&item["content"])?;
                 match role {
-                    "developer" | "system" => self.instructions.push(content),
-                    "user" | "assistant" => self.text(role, content),
+                    "developer" | "system" => {
+                        let text = content
+                            .iter()
+                            .map(|b| match b {
+                                InboundBlock::Text { text } => Some(text.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Option<Vec<_>>>()?;
+                        self.instructions.push(text.join("\n"));
+                    }
+                    "user" | "assistant" => {
+                        for block in content {
+                            self.push(role, block);
+                        }
+                    }
                     _ => return None,
                 }
             }
@@ -241,7 +270,7 @@ impl Bridge {
             }
             "function_call_output" | "custom_tool_call_output" => {
                 let id = item["call_id"].as_str()?;
-                let output = text_content(&item["output"])?;
+                let output = blocks_content(&item["output"])?;
                 if !self.pending.remove(id) {
                     return None;
                 }
@@ -249,7 +278,7 @@ impl Bridge {
                     "user",
                     InboundBlock::ToolResult {
                         tool_use_id: id.into(),
-                        content: ToolResultContent::Text(output),
+                        content: ToolResultContent::from_blocks(output),
                         is_error: false,
                     },
                 );
@@ -341,20 +370,25 @@ impl Bridge {
     }
 }
 
-fn text_content(content: &Value) -> Option<String> {
+fn blocks_content(content: &Value) -> Option<Vec<InboundBlock>> {
     if let Some(text) = content.as_str() {
-        return Some(text.into());
+        return Some(vec![InboundBlock::Text { text: text.into() }]);
     }
-    let parts = content.as_array()?;
-    let text: Option<Vec<_>> = parts
+    content
+        .as_array()?
         .iter()
         .map(|part| match part["type"].as_str()? {
-            "input_text" | "output_text" | "text" => part["text"].as_str(),
-            "refusal" => part["refusal"].as_str(),
-            _ => None,
+            "input_text" | "output_text" | "text" => Some(InboundBlock::Text {
+                text: part["text"].as_str()?.into(),
+            }),
+            "refusal" => Some(InboundBlock::Text {
+                text: part["refusal"].as_str()?.into(),
+            }),
+            _ => crate::media::parse_part(part, crate::media::Wire::Responses)
+                .ok()
+                .flatten(),
         })
-        .collect();
-    Some(text?.join("\n"))
+        .collect()
 }
 
 #[cfg(test)]

@@ -9,3 +9,5 @@
 pub mod protocol;
 pub mod responses;
 pub mod sse;
+
+pub mod gemini;

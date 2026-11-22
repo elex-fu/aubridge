@@ -1,9 +1,9 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { AgentConfigPage, AgentRow, AgentTestResult, fetchJson, postJson } from "./api";
-import { CopyBtn } from "./CopyButton";
 import { Dialog } from "./Dialog";
+import { TaskView } from "./TaskView";
 
-type Tab = "form" | "json" | "test";
+type Tab = "form" | "json" | "test" | "profile";
 type JsonObject = Record<string, unknown>;
 
 const ROLE_IDS = ["sonnet", "opus", "haiku", "fable"] as const;
@@ -72,6 +72,8 @@ export function AgentConfigModal({
   onClose,
   onSaved,
   setErr,
+  embedded = false,
+  onBusyChange,
 }: {
   agent: AgentRow;
   models: string[];
@@ -79,6 +81,8 @@ export function AgentConfigModal({
   onClose: () => void;
   onSaved: () => void;
   setErr: (s: string) => void;
+  embedded?: boolean;
+  onBusyChange?: (busy: boolean) => void;
 }) {
   const [data, setData] = useState<AgentConfigPage | null>(null);
   const [loadError, setLoadError] = useState("");
@@ -91,8 +95,11 @@ export function AgentConfigModal({
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<AgentTestResult | null>(null);
   const [testError, setTestError] = useState("");
-  const [showToken, setShowToken] = useState(false);
   const [saved, setSaved] = useState(false);
+  const busy = saving || testing;
+  useEffect(() => { onBusyChange?.(busy); return () => onBusyChange?.(false); }, [busy, onBusyChange]);
+  const frame = (content: ReactNode) => embedded ? <div className="agent-config-embedded">{content}</div> :
+    <Dialog label={`${agent.name} 高级配置`} busy={busy} onClose={onClose} className="modal-wide agent-config-modal">{content}</Dialog>;
 
   const applyPage = (page: AgentConfigPage) => {
     setData(page);
@@ -115,7 +122,7 @@ export function AgentConfigModal({
 
   if (!data) {
     return (
-      <Dialog label={`${agent.name} 高级配置`} onClose={onClose} className="modal-wide agent-config-modal">
+      frame(<>
         <div className="modal-header"><h2>{agent.name} 高级配置</h2></div>
         <div className="modal-body">
           {loadError ? (
@@ -126,7 +133,7 @@ export function AgentConfigModal({
           ) : <p className="muted">正在读取配置…</p>}
         </div>
         <div className="modal-actions"><button className="ghost" onClick={onClose}>关闭</button></div>
-      </Dialog>
+      </>)
     );
   }
 
@@ -140,7 +147,8 @@ export function AgentConfigModal({
   const tabs: { id: Tab; label: string }[] = [
     { id: "form", label: "参数" },
     ...(isClaude ? [{ id: "json" as const, label: "完整 JSON" }] : []),
-    { id: "test", label: "测试验证" },
+    ...(!isClaude && data.text ? [{ id: "profile" as const, label: "受管配置文本" }] : []),
+    ...(!embedded ? [{ id: "test" as const, label: "短文本连接测试" }] : []),
   ];
 
   const updateEnv = (updates: Record<string, string | null>) => {
@@ -322,7 +330,7 @@ export function AgentConfigModal({
   };
 
   return (
-    <Dialog label={`${agent.name} 高级配置`} busy={saving} onClose={onClose} className="modal-wide agent-config-modal">
+    frame(<>
       <div className="modal-header">
         <div className="row">
           <h2>{agent.name} 高级配置</h2>
@@ -656,32 +664,16 @@ export function AgentConfigModal({
                         />
                       </label>
                     </div>
-                    {data.text && (
-                      <details className="section-details">
-                        <summary>当前受管 profile TOML</summary>
-                        <pre>{data.text}</pre>
-                      </details>
-                    )}
+
                   </>
                 ) : <p className="muted">尚未接线，没有可编辑的受管 profile。</p>}
               </section>
             )}
 
-            {agent.token && (
-              <section className="agent-config-section">
-                <span className="section-label">本 Agent token</span>
-                <div className="row">
-                  <code>{showToken ? agent.token : "••••••••"}</code>
-                  <button className="ghost" aria-pressed={showToken} onClick={() => setShowToken(!showToken)}>
-                    {showToken ? "隐藏" : "显示"}
-                  </button>
-                  <CopyBtn key={`${agent.id}:${agent.token}`} text={agent.token} id={`复制 ${agent.name} Agent token`} />
-                </div>
-              </section>
-            )}
           </>
         )}
 
+        {tab === "profile" && data.text && <TaskView title="当前受管 profile TOML" busy={busy} onBack={() => setTab("form")}><pre className="task-log">{data.text}</pre></TaskView>}
         {tab === "json" && (
           <section className="agent-config-section">
             <div className="section-head">
@@ -713,12 +705,12 @@ export function AgentConfigModal({
         {tab === "test" && (
           <section className="agent-config-section">
             <div className="section-head">
-              <h3>测试验证</h3>
+              <h3>短文本连接测试</h3>
               <button className="button-primary" disabled={testing || !data.wired} onClick={runTest}>
                 {testing ? "测试中…" : "运行测试"}
               </button>
             </div>
-            <p className="muted">{data.test.note || "调用本机 CLI 验证配置。"}测试使用已保存的配置，可能会消耗订阅额度。</p>
+            <p className="muted">{data.test.note || "调用本机 CLI 测试短文本连接，不验证文件工具。"}测试使用已保存的配置，可能会消耗订阅额度。</p>
             {data.test.command && (
               <div className="field">
                 <span className="section-label">固定命令</span>
@@ -753,13 +745,13 @@ export function AgentConfigModal({
       </div>
       <div className="modal-actions">
         {saved && <span className="muted">已保存；测试将使用新配置</span>}
-        <button className="ghost" disabled={saving} onClick={onClose}>关闭</button>
-        {tab !== "test" && (
+        {tab !== "profile" && <button className="ghost" disabled={busy} onClick={onClose}>{embedded ? "返回连接与模型" : "关闭"}</button>}
+        {tab !== "test" && tab !== "profile" && (
           <button className="button-primary" onClick={save} disabled={saving || !canEdit}>
             {saving ? "保存中…" : "保存"}
           </button>
         )}
       </div>
-    </Dialog>
+    </>)
   );
 }

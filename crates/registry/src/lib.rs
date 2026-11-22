@@ -32,7 +32,15 @@ pub fn load(text: &str) -> Result<Manifest, LoadError> {
 
 /// 内置 preset(M1 三家,设计文档 §7 白名单)。
 pub fn presets() -> Vec<Manifest> {
-    [openrouter(), zhipu(), modelscope(), kimi_code(), chatgpt()].to_vec()
+    [
+        openrouter(),
+        zhipu(),
+        modelscope(),
+        kimi_code(),
+        chatgpt(),
+        claude_cli(),
+    ]
+    .to_vec()
 }
 
 fn manifest(json: serde_json::Value) -> Manifest {
@@ -121,6 +129,17 @@ pub fn chatgpt() -> Manifest {
         ],
         "quota": { "source": "usage_api", "rest_hint": "5h-window" },
         "permissions": { "net": ["chatgpt.com"], "store_key": false }
+    }))
+}
+
+/// Official locally installed Claude CLI; authentication remains owned by that CLI.
+pub fn claude_cli() -> Manifest {
+    manifest(serde_json::json!({
+        "id":"claude-cli", "version":"1", "kind":"subscription",
+        "provider":{"base":"https://claude.ai", "auth":"claude_cli", "protocol":"anthropic"},
+        "free_models":["sonnet", "opus", "haiku"],
+        "quota":{"source":"inferred", "rest_hint":"unknown"},
+        "permissions":{"net":["claude.ai"], "store_key":false}
     }))
 }
 

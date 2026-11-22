@@ -6,20 +6,9 @@
 //! 踩过的坑:智谱 envelope 限流当读失败、Kimi 三形状并容、数字
 //! 字符串/数值双态、reset 文本或 epoch 秒/毫秒。
 
-use std::sync::Mutex;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
+use crate::quota::{response_text, QuotaCache, QuotaRead};
+use manifest::quota::QuotaIssue;
 use serde_json::Value;
-
-const POSITIVE_TTL_SECS: u64 = 180;
-const NEGATIVE_TTL_SECS: u64 = 60;
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
 
 /// 归一后的 plan 窗口(util_5h/util_7d 字段口径:百分比 0–100,
 /// None = 未知不覆盖;reset 取最短已用窗口)。
@@ -28,6 +17,9 @@ pub struct PlanWindows {
     pub w5h: Option<f64>,
     pub w7d: Option<f64>,
     pub reset_at: Option<u64>,
+    pub reset_5h: Option<u64>,
+    pub reset_7d: Option<u64>,
+    pub span_5h: Option<u64>,
 }
 
 /// 端点鉴权形态:智谱把裸 key 放 `Authorization`(非 Bearer,
@@ -89,6 +81,8 @@ pub fn parse_zhipu(body: &str) -> Option<PlanWindows> {
     let mut w5h = None;
     let mut w7d = None;
     let mut short_reset = None;
+    let mut short_span = None;
+    let mut week_reset = None;
     for limit in data["limits"].as_array()? {
         if limit["type"].as_str() != Some("TOKENS_LIMIT") {
             continue; // TIME_LIMIT = MCP 月工具调用,不停模型
@@ -105,12 +99,15 @@ pub fn parse_zhipu(body: &str) -> Option<PlanWindows> {
             .filter(|t| *t > 0)
             .map(|t| (t / 1000) as u64); // 毫秒 → 秒
         if span_hours <= 24.0 {
-            w5h = used;
-            if reset.is_some() {
-                short_reset = short_reset.min(reset).or(reset);
+            let span = (span_hours * 3600.0) as u64;
+            if short_span.is_none_or(|previous| span <= previous) {
+                w5h = used;
+                short_reset = reset;
+                short_span = Some(span);
             }
         } else {
             w7d = used;
+            week_reset = reset;
         }
     }
     if w5h.is_none() && w7d.is_none() {
@@ -119,7 +116,10 @@ pub fn parse_zhipu(body: &str) -> Option<PlanWindows> {
     Some(PlanWindows {
         w5h,
         w7d,
-        reset_at: short_reset,
+        reset_at: short_reset.or(week_reset),
+        reset_5h: short_reset,
+        reset_7d: week_reset,
+        span_5h: short_span,
     })
 }
 
@@ -230,7 +230,14 @@ pub fn parse_kimi(body: &str) -> Option<PlanWindows> {
         (Some(_), Some(r)) => Some(r),
         _ => w7d_reset,
     };
-    Some(PlanWindows { w5h, w7d, reset_at })
+    Some(PlanWindows {
+        w5h,
+        w7d,
+        reset_at,
+        reset_5h: w5h_reset,
+        reset_7d: w7d_reset,
+        span_5h: w5h.map(|_| 18_000),
+    })
 }
 
 /// Kimi limits[].window 的 duration+timeUnit → 秒(未知 → None)。
@@ -315,11 +322,11 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
-/// 带 plan 窗口缓存的单飞拉取器(usage.rs UsageFetcher 同构)。
+/// Credential-scoped plan readings with their original observation metadata.
 pub struct PlanFetcher {
     endpoint: String,
     auth: PlanAuth,
-    cache: Mutex<Option<(u64, Option<PlanWindows>)>>,
+    cache: QuotaCache<PlanWindows>,
 }
 
 impl PlanFetcher {
@@ -327,49 +334,50 @@ impl PlanFetcher {
         Self {
             endpoint: endpoint.into(),
             auth,
-            cache: Mutex::new(None),
+            cache: QuotaCache::new(),
         }
     }
 
-    /// 拉取(缓存命中直接返回;负缓存防止错误风暴)。
     pub async fn fetch(&self, client: &reqwest::Client, key: &str) -> Option<PlanWindows> {
-        {
-            let guard = self.cache.lock().expect("plan cache lock");
-            if let Some((expires, cached)) = &*guard {
-                if now_secs() < *expires {
-                    return *cached;
-                }
-            }
-        }
-        let result = self.fetch_once(client, key).await;
-        let ttl = if result.is_some() {
-            POSITIVE_TTL_SECS
-        } else {
-            NEGATIVE_TTL_SECS
-        };
-        *self.cache.lock().expect("plan cache lock") = Some((now_secs() + ttl, result));
-        result
+        self.read(client, key).await.value
     }
 
-    async fn fetch_once(&self, client: &reqwest::Client, key: &str) -> Option<PlanWindows> {
-        let mut request = client
+    pub async fn read(&self, client: &reqwest::Client, key: &str) -> QuotaRead<PlanWindows> {
+        self.cache.read(key, || self.fetch_once(client, key)).await
+    }
+
+    async fn fetch_once(
+        &self,
+        client: &reqwest::Client,
+        key: &str,
+    ) -> Result<PlanWindows, QuotaIssue> {
+        let request = client
             .get(&self.endpoint)
-            .timeout(Duration::from_secs(10))
             .header("Accept", "application/json");
-        request = match self.auth {
-            // 智谱:裸 key(magpie 实测;Bearer 会被拒)。
+        let request = match self.auth {
             PlanAuth::RawKey => request.header("Authorization", key),
             PlanAuth::Bearer => request.bearer_auth(key),
         };
-        let response = request.send().await.ok()?;
-        if !response.status().is_success() {
-            return None;
+        let body = response_text(request).await?;
+        let envelope: Value =
+            serde_json::from_str(&body).map_err(|_| QuotaIssue::InvalidResponse)?;
+        let code = envelope["code"]
+            .as_i64()
+            .or_else(|| envelope["error"]["code"].as_i64());
+        match code {
+            Some(401 | 403 | 1000..=1005) => return Err(QuotaIssue::Authentication),
+            Some(429 | 1302 | 1303) => return Err(QuotaIssue::RateLimited),
+            Some(code) if code != 0 && code != 200 => return Err(QuotaIssue::Upstream),
+            _ => {}
         }
-        let body = response.text().await.ok()?;
+        if envelope["success"] == false || envelope["error"].is_object() {
+            return Err(QuotaIssue::Upstream);
+        }
         match self.auth {
             PlanAuth::RawKey => parse_zhipu(&body),
             PlanAuth::Bearer => parse_kimi(&body),
         }
+        .ok_or(QuotaIssue::Unsupported)
     }
 }
 

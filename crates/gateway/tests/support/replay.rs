@@ -155,7 +155,8 @@ async fn spawn_inner(
     let mut app = Router::new()
         .route("/chat/completions", post(handler.clone()))
         .route("/messages", post(handler.clone()))
-        .route("/responses", post(handler));
+        .route("/responses", post(handler.clone()))
+        .route("/responses/compact", post(handler));
     if let Some(stub) = refresh {
         let json = stub.response_json;
         app = app.route(
