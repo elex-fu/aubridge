@@ -14,3 +14,5 @@ crates/smoke/gen/
 /environment
 /saved
 __pycache__/
+# 临时设计、分析和迭代文档仅保留在本机。
+/docs/

@@ -52,6 +52,8 @@ Unix 下会话文件权限为 `0600`，正常退出时自动清理。
 
 ## 设计与文档
 
+`docs/` 为仅保留在本机的临时资料，不随远端提交。以下及文中相关链接仅供本地查阅；全新克隆没有该目录属于正常情况。
+
 - `docs/product-design.md` —— 唯一权威方案(含变更记录)
 - `docs/crate-layout.md` —— 工程结构与 crate 分层
 - `docs/engineering-constraints.md` —— 已拍板的工程约束
